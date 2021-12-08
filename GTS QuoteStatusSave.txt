@@ -1,0 +1,113 @@
+/**************************************************************************************************************
+* Name: GTS_SiteQuoteSaveCtrl
+* Description: This class will persist the Quote Approval status back to SFDC records from the Customer.
+* Test Class: GTS_SiteQuoteSaveCtrlTest
+* Change History:
+* <Version>    <Date of Change>    <Author Name>           <Describe the changes made>
+* ---------------------------------------------------------------------------------
+* v1.0         30-Nov-2021       	Srija Baskaran       First Version
+***************************************************************************************************************/
+public without sharing class GTS_SiteQuoteSaveCtrl {
+    
+    @AuraEnabled
+    public static void saveQuoteStatustoSFDC(Map<String,Boolean> saveApprovedQLIMap,Map<String,Boolean> saveRejectedQLIMap){
+        List<GTS_Customer_Quote_Line_Items__c> approvedQLIList;
+        List<GTS_Customer_Quote_Line_Items__c> rejectedQLIList;
+         //Added by Radha V
+        //List<QuoteLineItem> updateQuoteLineList = new List<QuoteLineItem>();
+        List<GTS_Customer_Quote_Line_Items__c> updateQLIList = new List<GTS_Customer_Quote_Line_Items__c>();
+        Id quoteId;
+
+        try {
+            if(!saveApprovedQLIMap.isEmpty()){
+                approvedQLIList =[SELECT Id,GTS_Status__c,GTS_Customer_Quote__c,GTS_Quote_Line_Item__c FROM GTS_Customer_Quote_Line_Items__c 
+                                  WHERE Id IN :saveApprovedQLIMap.keySet()];
+                for(GTS_Customer_Quote_Line_Items__c qli: approvedQLIList){
+                    qli.GTS_Status__c = 'Approved';
+                   quoteId = qli.GTS_Customer_Quote__c;
+                    updateQLIList.add(qli);
+                     //Added by Radha V
+                    //updateQuoteLineList.add(new QuoteLineItem(Id =qli.GTS_Quote_Line_Item__c,GTS_Status__c ='Approved'));
+                }
+            }
+            
+            if(!saveRejectedQLIMap.isEmpty()){
+                rejectedQLIList =[SELECT Id,GTS_Status__c,GTS_Customer_Quote__c FROM GTS_Customer_Quote_Line_Items__c 
+                                  WHERE Id IN :saveRejectedQLIMap.keySet()];
+                for(GTS_Customer_Quote_Line_Items__c qli: rejectedQLIList){
+                    qli.GTS_Status__c = 'Rejected';
+                    quoteId = qli.GTS_Customer_Quote__c;
+                    updateQLIList.add(qli);
+                     //Added by Radha V
+                    //updateQuoteLineList.add(new QuoteLineItem(Id =qli.GTS_Quote_Line_Item__c,GTS_Status__c ='Rejected'));
+                }
+            }
+            if(!updateQLIList.isEmpty()){
+               system.debug('final size:'+updateQLIList.size());
+               update updateQLIList;
+                //Added by Radha V
+                //update updateQuoteLineList;
+                system.debug('quoteId::' + quoteId);
+                if(quoteId != null){
+                    UpdateCustQuotebasedonQLI(quoteId);
+                    
+                }
+            }
+
+        } catch (Exception e) {
+            system.debug('Exception:'+e.getMessage());
+        }
+    }
+    public static void UpdateCustQuotebasedonQLI(Id quoteId){
+        
+        String quoteStatus;
+        Integer totalLineItemCount;
+        Integer approvedCount = 0;
+        Integer rejectCount = 0;
+        Integer restCount = 0;
+        Double approvedAmt = 0;
+        
+        try{
+        for (AggregateResult ar : [SELECT GTS_Status__c, SUM(GTS_Sales_Price__c) Amt,COUNT(GTS_Sales_Price__c) ItemCount 
+                                    FROM GTS_Customer_Quote_Line_Items__c WHERE GTS_Customer_Quote__c =:quoteId
+                                    GROUP BY GTS_Status__c]){
+                        if(ar.get('GTS_Status__c') == 'Approved'){
+                        	approvedAmt = Double.valueOf(ar.get('Amt'));
+                            approvedCount = Integer.valueOf(ar.get('ItemCount'));
+                        }else if(ar.get('GTS_Status__c') == 'Rejected'){
+                            rejectCount = Integer.valueOf(ar.get('ItemCount'));
+                        }else{
+                            restCount = Integer.valueOf(ar.get('ItemCount'));
+                        }
+                 }//end for loop
+                 
+                  totalLineItemCount = approvedCount + rejectCount+ restCount;
+                    if(totalLineItemCount == approvedCount){
+                       quoteStatus = 'Approved';
+                    }else if(totalLineItemCount == rejectCount){
+                        quoteStatus = 'Rejected';
+                    }else if(rejectCount != 0 && rejectCount < totalLineItemCount && 
+                             approvedCount != 0 && approvedCount < totalLineItemCount){
+                        quoteStatus = 'Partially Approved';
+                    }
+                    //updating the status of corresponding GTS Customer Quote
+                    if(quoteStatus != null){
+                        GTS_Customer_Quote__c quote = new GTS_Customer_Quote__c();
+                        quote.Id = quoteId;
+                        quote.GTS_Status__c = quoteStatus;
+                        quote.GTS_Approved_Quote_Amount__c = approvedAmt;
+                        update quote;
+                        //Added by Radha V
+                        /*GTS_Customer_Quote__c qt =[SELECT Id,Name,GTS_Status__c,GTS_Quote__c from GTS_Customer_Quote__c Where Id = :quoteId];
+                        Quote updateQuote = new Quote();
+                        updateQuote.Id = qt.GTS_Quote__c;
+                        updateQuote.Status = quoteStatus;
+                        update updateQuote;*/
+                    }
+        }
+        catch(Exception e){
+            system.debug('Exception:'+e.getMessage());
+        }
+        
+    }
+}

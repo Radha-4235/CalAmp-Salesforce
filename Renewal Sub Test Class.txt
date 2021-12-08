@@ -1,0 +1,83 @@
+@istest
+public class SubscriptionOPRenewalBatchTest{
+    
+    
+    @TestSetup
+    static void setup() {
+        
+    }
+    @isTest
+    static void corporateTest() {
+        Account acc=new Account(Name='Test SubAccount');
+        insert acc;
+        Contact contact=new Contact(FirstName='testSub',LastName='Contact',Email='test@gmail.com',MobilePhone='+447895855852',
+                                    AccountId=acc.id,MailingPostalCode='12346');
+        insert contact;
+        Product2 prd=new Product2(Name='ABB_CLASSIC Test',Product_Group__c='SVR',Vehicle_Type__c='Car',CurrencyIsoCode='EUR',
+                                  Product_Class__c='GENERIC',ProductCode='ABB_CLASSIC',Period_In_Months__c=12);
+        insert prd;
+        Product2 prd1=new Product2(Name='ABB_CLASSIC Test',Product_Group__c='SVR',Vehicle_Type__c='Car',CurrencyIsoCode='EUR',
+                                   Product_Class__c='GENERIC',ProductCode='SERVIZIO_5STAR',Period_In_Months__c=12);
+        insert prd1;
+        Product2 prd2=new Product2(Name='LJ PLATINUM Test',Product_Group__c='SVR',Vehicle_Type__c='Car',CurrencyIsoCode='EUR',
+                                   Product_Class__c='GENERIC',ProductCode='LJ PLATINUM',Period_In_Months__c=13);
+        insert prd2;
+        Pricebook2 customPB = new Pricebook2(Name='Custom Pricebook', isActive=true);
+        insert customPB;
+        
+        Id pricebookId = Test.getStandardPricebookId();
+        PricebookEntry standardPrice = new PricebookEntry(Pricebook2Id = pricebookId, Product2Id = prd.Id,CurrencyIsoCode='EUR',
+                                                          UnitPrice = 10000, IsActive = true);
+        insert standardPrice;
+        
+        PricebookEntry customPrice = new PricebookEntry(Pricebook2Id = customPB.Id, Product2Id = prd.Id,CurrencyIsoCode='EUR',
+                                                        UnitPrice = 12000, IsActive = true);
+        insert customPrice;
+        Order ord = new Order(Name='Order SubOpTest',EffectiveDate=date.today(),Status='Draft',AccountId=acc.id,CurrencyIsoCode='EUR',
+                              Pricebook2Id=customPB.id,Sales_Source__c=acc.id,Payment_Type__c='Single Payment',Type='Retail');
+        insert ord;
+        Order_Proposition__c ordProp=new Order_Proposition__c(Order__c=ord.id,List_Price__c=10,Sales_Price__c=11.55);
+        insert ordProp;
+        
+        OrderItem orItem=new OrderItem(OrderId=ord.id,UnitPrice=11.20,Quantity=1,Order_Proposition__c=ordProp.id,
+                                       PricebookentryId=customPrice.id);
+        insert orItem; 
+        Subscription__c subrec = new Subscription__c(Account__c=acc.id,Contact__c=contact.id,Status__c='Active',Order__c=ord.id,Product__c=prd.id,
+                                                     Is_Renewal__c=true,Renewal_Method__c='Manual',
+                                                     Duration_Months__c=prd.Period_In_Months__c,Start_Date__c=date.today(),End_Date__c=date.today()+1);
+        insert subrec;
+        Subscription__c subrec1 = new Subscription__c(Account__c=acc.id,Contact__c=contact.id,Status__c='Renewed',Order__c=ord.id,Product__c=prd1.id,
+                                                      Is_Renewal__c=true,Renewal_Method__c='Manual',Start_Date__c=subrec.End_Date__c + 1,
+                                                      Duration_Months__c=prd.Period_In_Months__c,Renewed_From_Subscription__c=subrec.id,
+                                                      End_Date__c=subrec.Start_Date__c.addMonths(integer.valueOf(prd.Period_In_Months__c)));
+        insert subrec1;
+        
+        Payment__c payment=new Payment__c(Account__c=acc.id,Amount__c=10,Order__c=ord.id,Status__c='Draft');
+        insert payment;
+        Subscription_Payment__c subPayment=new Subscription_Payment__c(Payment__c=payment.Id,Subscription__c=subrec.id);
+        insert subPayment;
+        Additional_Service__c adService=new Additional_Service__c(Subscription__c=subrec1.id,Status__c='Active',Order__c=ord.id,Product__c=prd2.id,
+                                                                  Start_Date__c=subrec.End_Date__c + 1,End_Date__c=subrec.Start_Date__c.addMonths(integer.valueOf(prd.Period_In_Months__c)));
+        insert adService;
+        Vat_Rate__c vatRate=new Vat_Rate__c(Name='Vat Test',Description__c='SubOp Vat Test',Tax_Percent__c=20);
+        insert vatRate;
+        Vat_Rate__c vatRate1=new Vat_Rate__c(Name='Vat RateTest',Description__c='SubOp VatRate',Tax_Percent__c=30);
+        insert vatRate1;
+        SubscriptionOP__c subOp=new SubscriptionOP__c(Sub_Name__c=[SELECT ID,name FROM Subscription__c where id=:subrec.id].name,Type__c='SUB',
+                                                      Status__c='Pending',
+                                                      Invoice_Time__c='Manual',ProductCode__c=prd.ProductCode,
+                                                      Payment_Type__c='Single Payment',SalesPrice__c=11,Vat_Rate_Id__c=vatRate.id,
+                                                      Receipt_Method__c='LJIT DIRECT DEBIT',Pricebook_Id__c=customPrice.id);
+        insert subOp;
+        
+        SubscriptionOP__c subOoep=new SubscriptionOP__c(Sub_Name__c=[SELECT ID,name FROM Subscription__c where id=:subrec.id].name,Type__c='AS',Status__c='Pending',
+                                                        Invoice_Time__c='Manual',ProductCode__c=prd1.ProductCode,Vat_Rate_Id__c=vatRate1.id,
+                                                        Payment_Type__c='Single Payment',SalesPrice__c=11,Receipt_Method__c='LJIT DIRECT DEBIT',
+                                                        Pricebook_Id__c=customPB.id);
+        insert subOoep;
+        SubscriptionOPRenewalBatch subJob=new SubscriptionOPRenewalBatch();
+        database.executebatch(subJob);
+        
+    }	
+    
+}

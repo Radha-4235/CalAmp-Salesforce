@@ -1,0 +1,42 @@
+/**
+* @Description Create planning
+* @Change DX-135
+* @Author Radha Vennapusa
+* @Date 17thAug2021
+* 
+* Date       Author         Change Description
+* -------------------------------------------------------------------------------------------------------------
+*
+*/
+public class GetSubscriptionsResponse{
+
+	public String subscriptionId;
+	public String vin;
+	public CurrentPlan currentPlan;
+	public RenewalPlan renewalPlan;
+
+	public class CurrentPlan {
+		public String planId;
+		public String name;
+		public String description;
+		public Integer termMonths;
+		public String startDate;
+		public String expiryDate;
+		public String statusId;
+		public String features;
+	}
+
+	public class RenewalPlan {
+		public String planId;
+		public String name;
+		public String description;
+		public Integer termMonths;
+		public String startDate;
+		public String expiryDate;
+	}
+
+	
+	public static List<GetSubscriptionsResponse> parse(String json) {
+		return (List<GetSubscriptionsResponse>) System.JSON.deserialize(json, List<GetSubscriptionsResponse>.class);
+	}
+}

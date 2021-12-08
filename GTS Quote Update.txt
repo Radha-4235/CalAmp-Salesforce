@@ -1,0 +1,64 @@
+public class GTS_CustomerQuoteTriggerHelper {
+    public static void updateGTSQuoteStatusToQuote(List<GTS_Customer_Quote__c> gtsQuoteList){
+        List<GTS_Customer_Quote__c> notCopiedGTSCustomerQuotes = new List<GTS_Customer_Quote__c>();
+        Map<Id,String> quoteIdToStatus = new Map<Id,String>();
+        try{
+            if(!gtsQuoteList.isEmpty()){
+                for(GTS_Customer_Quote__c gtsQuote : gtsQuoteList){
+                    if(gtsQuote.GTS_Status__c != 'Copied'){
+                        notCopiedGTSCustomerQuotes.add(gtsQuote);
+                    }
+                }
+                if(!notCopiedGTSCustomerQuotes.isEmpty()){
+                    for(GTS_Customer_Quote__c gt:notCopiedGTSCustomerQuotes){
+                        quoteIdToStatus.put(gt.GTS_Quote__c,gt.GTS_Status__c);
+                    }
+                    updateQuoteStatus(quoteIdToStatus);
+                    updateQuoteLineItemStatus(notCopiedGTSCustomerQuotes);
+                }
+            }
+        }catch(Exception e){
+            System.debug('Exception:'+e.getMessage());
+        }
+    }
+    
+    public static void updateQuoteStatus(Map<Id,String> updateQuoteStatusMap){
+        List<Quote> updatedQuotes = new List<Quote>();
+        try{
+            if(!updateQuoteStatusMap.isEmpty()){
+                for(Quote quoteUpdate:[SELECT Id,Name,Status from Quote WHERE Id IN :updateQuoteStatusMap.keySet()]){
+            	quoteUpdate.Status = updateQuoteStatusMap.get(quoteUpdate.Id);
+                updatedQuotes.add(quoteUpdate);
+        }
+                if(!updatedQuotes.isEmpty()){
+                    update updatedQuotes;
+                }
+            }
+             
+        }catch(Exception e){
+             System.debug('Exception:'+e.getMessage());
+        }
+       
+    }
+    public static void updateQuoteLineItemStatus(List<GTS_Customer_Quote__c> gtsCusQuoteList){
+        Map<Id,String> quoteLineIdToStatusMap = new Map<Id,String>();
+        try{
+        for(GTS_Customer_Quote_Line_Items__c gtsQuoteLineItem:[SELECT Id,Name,GTS_Quote__c,GTS_Quote_Line_Item__c,
+                                                              GTS_Status__c,GTS_Customer_Quote__c FROM GTS_Customer_Quote_Line_Items__c
+                                                              WHERE GTS_Customer_Quote__c IN :gtsCusQuoteList]){
+           quoteLineIdToStatusMap.put(gtsQuoteLineItem.GTS_Quote_Line_Item__c,gtsQuoteLineItem.GTS_Status__c);
+            
+        }
+        List<QuoteLineItem> updatedQuoteLineList = new List<QuoteLineItem>();
+        for(QuoteLineItem qt: [SELECT Id,GTS_Status__c FROM QuoteLineItem WHERE Id IN :quoteLineIdToStatusMap.keySet()]){
+            qt.GTS_Status__c = quoteLineIdToStatusMap.get(qt.Id);
+            updatedQuoteLineList.add(qt);
+        }
+        if(!updatedQuoteLineList.isEmpty()){
+            update updatedQuoteLineList;
+        }
+        }catch(Exception e){
+            System.debug('Exception:'+e.getMessage());
+        }
+    }
+}

@@ -1,0 +1,46 @@
+/**
+* @Description Create planning
+* @Change DX-135
+* @Author Radha Vennapusa
+* @Date 17thAug2021
+* 
+* Date       Author         Change Description
+* -------------------------------------------------------------------------------------------------------------
+*
+*/
+@RestResource(urlMapping='/GET/subscription')
+global with sharing class GetSubscriptionsPlanning {
+  
+     global class GetSubscriptionsResponse extends ODSConstants.ODSResponse {
+    }  
+    @HttpGet 
+    global static list<GetSubscriptionsResponse> getSubscription() {
+        String accountId =RestContext.request.params.get('accountId');
+        String appKey =RestContext.request.params.get('appKey');
+        String language =RestContext.request.params.get('language');
+        list<GetSubscriptionsResponse>  subRes=new list<GetSubscriptionsResponse> ();
+        List<Subscription__c> subList = [SELECT id,name,Status__c,Start_Date__c,End_Date__c,Duration_Months__c,Vehicle_Ownership__r.Is_Current_Ownership__c,
+                                    Vehicle_Ownership__r.Account__c,Vehicle_Ownership__r.Vehicle_VIN__c,Product__r.Ctc_Features__c,
+                                    Product__r.Ctc_Hierarchy__r.Ctc_Application_Key__c,Unit__c,Product__r.id FROM Subscription__c 
+                                         WHERE Vehicle_Ownership__r.Account__c =:accountId and Product__r.Ctc_Hierarchy__r.Ctc_Application_Key__c =:appKey and
+                                         Vehicle_Ownership__r.Is_Current_Ownership__c = True and Unit__c <> null];
+        GetSubscriptionsResponse response=new GetSubscriptionsResponse();
+        for(Subscription__c sub:subList){
+            response=new GetSubscriptionsResponse();
+            response.subscriptionId=sub.id;
+            if(sub.Status__c='Active'){
+                response.CurrentPlan currplan=new response.CurrentPlan();
+                currplan.planId='text';
+            }
+            
+            //else check for renewl
+            response.RenewalPlan renewalPlan=new response.RenewalPlan();
+            renewalPlan.planId='text';
+            subRes.add(response);
+        }
+        
+        return subRes;
+        
+}
+    
+}

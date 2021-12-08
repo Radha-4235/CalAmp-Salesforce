@@ -1,0 +1,3197 @@
+/**
+* @Description Support class for planning
+* @Change DX-47
+* @Author Mattia Corbellini
+* @Date 20200526
+* 
+* Date       Author         Change Description
+* -------------------------------------------------------------------------------------------------------------
+*
+*/
+
+public class ODSPlanner {
+    
+    private Account reseller;
+    private Id accountSalesSourceId;
+    private Account ownerAccount;
+    private Contact ownerContact;
+    private Vehicle__c vehicle;
+    private Vehicle_Ownership__c vehicleOwnership;
+    private Order order;
+    private Opportunity opportunity;
+    private Opportunity originOpportunity;
+    private Subscription__c subscription;
+    private Job__c job;
+    private Unit__c unit;
+    
+    private OpportunityLineItem packageOLI;
+    private Product2 subscriptionProduct, jobProduct;
+    
+    private Boolean isPackage = false;
+    
+    private Id accountRecordTypeId;
+    private Id contactRecordTypeId;
+    private Id orderId;
+    private Order triangulationOrder;
+    private Id triangulationAccountId;
+    private Id pricebookID;
+    
+    private Map<Id,Id> orderItemMap;
+    
+    private Boolean isTriangulation = false;
+    private Id triangulationOpportunityId;
+    
+    private List<OpportunityLineItem> oliList;
+    
+    private List<Additional_Service__c> asList;
+    
+    private Set<Id> productIDSToSearch;
+    
+    private Decimal subsCustomLength;
+    private Boolean isSubsCustomLength = false;
+    private Map<Id, sObject> updJobOrSubTriangulationMap; //DX-93
+    
+    private Order_Proposition__c prop;
+    private List<Payment__c> paymentsList;
+    
+    Payment__c subPayment, nonSubPayment;
+    
+    private Instalment_Header__c instalmentHeader;
+    //private Subscription_Instalment_Header__c subInstalmentHeader;
+    
+    private Decimal totalNonSubAmount, totalSubAmount;
+    
+    private Boolean isSplitPayment;
+    private String splitPayment;
+    
+    private PromotionsHandler.PromotionRequest promoRequest;
+    private Set<String> productsIds;
+    private Boolean searchForPromo = false;
+    
+    private String errorMessage = Label.ODS_EX_Generic_Error;
+    
+    private String accountType;
+    private String revenueChannel;
+    
+    private String caseSuggestedSolution;
+    private String caseAutoResolution;
+    
+    private Stock_Order_Line_Item__c unitSoli;
+    
+    private boolean unitExchangeWithoutAdditionalYears = false,
+    changeVOWithoutAdditionalYears = false;
+    
+    public ODSPlanner() {
+    }
+    
+    /* 
+     * 20200526 MC
+     * Create a draft Job
+     * passed as parameters. 
+     */
+    public String createPlan(ODSCreatePlanning.CreatePlanningRequest planning) {
+        System.debug('ODSPlanner.createPlan');
+        updJobOrSubTriangulationMap = new Map<Id, sObject>(); //DX-93
+        
+        // 0 Get the reseller and check if it's blocked
+        setEnabledReseller(planning.salesSourceID);
+        
+        // 0 Get Opportunity and check the contract for Corporate or Dealer Account
+        setOpportunity(planning.subscriptionOpportunityId);
+        originOpportunity = opportunity.clone(); //DX-109
+        
+        // Triangulation with stock subscription
+        System.debug('opportunity.AccountId ' + opportunity.AccountId);
+        System.debug('reseller.Id ' + reseller.Id);
+        if (opportunity.AccountId != reseller.Id) {
+            isTriangulation = true;
+            triangulationOpportunityId = opportunity.Id;
+            triangulationAccountId = opportunity.AccountId;
+            opportunity = [
+                SELECT  Id, CurrencyIsoCode, Has_A_Valid_Contract__c, Channel__c, Jobs_Grouping__C, Triangulation__c,
+                Vat_Rate__c, Invoice_Time__c, Is_Unit_Rental__c, Payment_Terms__c, Invoice_Grouping__c,
+                Invoice_Product_Group__c, Invoice_Split__c, Invoice_Instalments_Split__c,
+                Revenue_Channel__c, Payment_Type__c, Receipt_Method__c, Split_Payment__c, 
+                pricebook2id, pricebook2.Product_Price_Book__c, Is_Hold_Stock_Movement__c,
+                Is_Job_Performed_by_Customer__c, Is_Free_Subscription__c, Is_Free_Unit__c,Renewal_Cancellation_Requested__c
+                FROM    Opportunity 
+                WHERE   Triangulation__c = :opportunity.id
+                AND     AccountId = :reseller.Id
+                AND     StageName = :bg_Constants.OPPORTUNITY_STAGE_CLOSED_ACTIVE
+                AND     Subsidiary_fx__c = :bg_Constants.USER_SUBSIDIARY_LJIT  
+                LIMIT 1];
+            
+            //triangulationOrder = [select id from Order where opportunityid  = :triangulationOpportunityId limit 1];
+            // DX-93
+            List<Stock_Order_Line_Item__c> soliList = [
+                SELECT	Id, Order__c, Order__r.Id, Order__r.OpportunityId, Order__r.accountid
+                FROM 	Stock_Order_Line_Item__c
+                WHERE	Order__r.OpportunityId = :triangulationOpportunityId
+                AND		Subscription__c = NULL
+                AND		Job__c = NULL
+                AND 	Stock_Order_Type__c IN (:bg_Constants.PRODUCT_CATEGORY_JOB,:bg_Constants.PRODUCT_CATEGORY_SUBSCRIPTION)
+                AND 	Order__r.Status = :bg_Constants.ORDER_STATUS_PAID
+                LIMIT   1];
+            
+            if(soliList.size() > 0){
+                triangulationOrder = soliList[0].Order__r;
+            }
+            // DX-93 End
+            
+            System.debug('opportunity.id ' + opportunity.id);
+            System.debug('triangulationOpportunityId ' + triangulationOpportunityId);
+        }
+        System.debug('isTriangulation ' + isTriangulation);
+        
+        if (contractCheckNeeded()) {
+            if (!opportunity.Has_A_Valid_Contract__c) {
+                throw new ODSConstants.ODSException(Label.ODS_EX_Invalid_Contract);
+            }
+        }
+        
+        // 0 Get the Subscription and Job product ID
+        try {
+            OpportunityLineItem oli = [SELECT Product2.Id, Product2.ProductCode, Product2.Variable_Period_In_Months__c, Product2.Period_In_Months__c, Opportunity.Accountid, Product2.Family, ListPrice, UnitPrice FROM OpportunityLineItem WHERE Product2.Family in (:bg_Constants.PRODUCT_CATEGORY_SUBSCRIPTION, :bg_Constants.PRODUCT_CATEGORY_PROPOSITION) AND Id = :planning.subscriptionOliID LIMIT 1];
+            
+            accountSalesSourceId = oli.Opportunity.Accountid;
+            
+            System.debug('oli.Product2.Id ' +oli.Product2.Id);
+            
+            productIDSToSearch = new Set<Id>();
+            
+            if (oli.Product2.Family == bg_Constants.PRODUCT_CATEGORY_PROPOSITION) {
+                
+                for (Product2 pr : [SELECT id, ProductCode, Variable_Period_In_Months__c, Period_In_Months__c, Family 
+                                    from Product2 
+                                    where id in (select Proposition_Product__c 
+                                                 from Proposition_Product__c 
+                                                 where Proposition__c = :oli.Product2.Id)]) {
+                                                     
+                                                     productIDSToSearch.add(pr.Id);
+                                                     
+                                                     if (pr.Family == bg_Constants.PRODUCT_CATEGORY_SUBSCRIPTION) {
+                                                         subscriptionProduct = pr;
+                                                         System.debug('check subscriptionProduct.ProductCode ' + subscriptionProduct.ProductCode);
+                                                         System.debug('check oli.Product2.ProductCode ' + oli.Product2.ProductCode);                        
+                                                     } else if (pr.Family == bg_Constants.PRODUCT_CATEGORY_JOB) {
+                                                         jobProduct = pr;
+                                                     }
+                                                 }
+                //productIDSToSearch.add(oli.Product2.Id);
+                pricebookID = opportunity.pricebook2.Product_Price_Book__c;
+                packageOLI  = oli;
+                isPackage = true;
+            } else {
+                setSubscriptionProduct(oli);
+                OpportunityLineItem jobOLI = [SELECT Product2.Id, Product2.ProductCode, Product2.Family FROM OpportunityLineItem WHERE OpportunityId = :opportunity.Id AND Product2.Family = :bg_Constants.PRODUCT_CATEGORY_JOB AND Product2.Job_Type__c = :bg_Constants.JOB_TYPE_INSTALL LIMIT 1];                
+                setJobProduct(jobOLI);
+                
+                pricebookID = opportunity.Pricebook2Id;
+                
+                productIDSToSearch.add(oli.Product2.Id);
+                productIDSToSearch.add(jobOLI.Product2.Id);
+            }
+            
+            System.debug('isPackage ' + isPackage);
+            
+            try {
+                if (subscriptionProduct.Variable_Period_In_Months__c) {
+                    isSubsCustomLength = true;
+                    subsCustomLength = decimal.valueOf(planning.subscriptionDuration);
+                }
+            } catch (Exception e) {
+                System.debug('Exception: ' + e.getMessage());
+            }
+            
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            throw new ODSConstants.ODSException(Label.ODS_EX_Opportunity_Not_Well_Formed);
+        }
+        
+        setIsSplitPayment();
+        
+        // 1 Search/create Owner
+        ownerCreateOrRetrieve(planning);
+        
+        // 2 Search/create Vehicle/Ownership
+        vehicleCreateOrRetrieve(planning);
+        
+        // 3 Create Order
+        odsOrderCreation(planning);
+        
+        // 4 Create Job
+        jobCreation(planning);
+        
+        // 5 Create Subscription
+        subscriptionCreation(planning);
+        
+        // 6 Search for promo
+        setupPromoPlanning();
+        searchForPromotion();
+        
+        // 7 setup payments
+        setPayment();        
+        
+        //DX-93 Triangulation leave it till last moment
+        if(updJobOrSubTriangulationMap.size() > 0){
+            Id jobID = System.enqueueJob(new QueueableTriangulationLink(updJobOrSubTriangulationMap));
+            System.debug('SYS QueueableTriangulationLink scheduled JobID:'+jobID);
+        }
+        
+        return job.Id;
+    }
+    
+    private void setSubscriptionProduct(OpportunityLineItem oli) {
+        subscriptionProduct = new Product2(id = oli.Product2.Id);
+        subscriptionProduct.ProductCode = oli.Product2.ProductCode;
+        subscriptionProduct.Variable_Period_In_Months__c = oli.Product2.Variable_Period_In_Months__c;
+        subscriptionProduct.Period_In_Months__c = oli.Product2.Period_In_Months__c;
+        subscriptionProduct.Family = oli.Product2.Family;
+        System.debug('check subscriptionProduct.ProductCode ' + subscriptionProduct.ProductCode);
+        System.debug('check oli.Product2.ProductCode ' + oli.Product2.ProductCode);
+    }
+    
+    private void setJobProduct(OpportunityLineItem oli) {
+        jobProduct = new Product2(id = oli.Product2.Id);
+        jobProduct.ProductCode = oli.Product2.ProductCode;
+        jobProduct.Family = oli.Product2.Family;
+    }    
+    
+    /*
+     * 20200721 MC
+     * Attach installation info
+     */
+    public String attachInstallationInfo(ODSInstallationInfo.InstallationInfoRequest info) {
+        System.debug('ODSPlanner.attachInstallationInfo');
+        
+        if (String.isEmpty(info.jobID)) {
+            throw new ODSConstants.ODSException(Label.ODS_EX_Job_Not_Found);
+        } if (String.isEmpty(info.siteID) && String.isEmpty(info.engineerID)) {
+            throw new ODSConstants.ODSException(Label.ODS_EX_Empty_Installation_Info);
+        } else {
+            try {
+                System.debug('ODSPlanner.attachInstallationInfo info.engineerID ' + info.engineerID);         
+                
+                job = [SELECT id, Site__c, Engineer__c FROM Job__c WHERE id = :info.jobID];
+                
+                if (!String.isEmpty(info.siteID)) {
+                    job.Site__c = info.siteID;
+                }
+                
+                if (!String.isEmpty(info.accountID)) {
+                    job.Installer__c = info.AccountId;
+                }
+                
+                if (!String.isEmpty(info.engineerID)) {
+                    job.Engineer__c = info.engineerID;
+                    
+                    if (String.isEmpty(info.accountID)) {
+                        Contact installer = [select AccountId from contact where id = :info.engineerID];
+                        job.Installer__c = installer.AccountId;
+                    }
+                }
+                
+                //job.Status__c = bg_Constants.JOB_STATUS_SCHEDULED;
+                
+                update job;
+                
+            } catch (Exception e) {
+                System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+                throw new ODSConstants.ODSException(Label.ODS_EX_In_Job_Updating);
+            }
+        }
+        
+        return job.id;
+    }
+    
+    /*
+     * 20200909 MC
+     * Attach installation dates
+     */
+    public String attachInstallationDates(ODSInstallationDates.InstallationDatesRequest info) {
+        System.debug('ODSPlanner.attachInstallationDates');
+        
+        if (String.isEmpty(info.jobID)) {
+            throw new ODSConstants.ODSException(Label.ODS_EX_Job_Not_Found);
+        } else {
+            try {
+                System.debug('ODSPlanner.attachInstallationDates info.jobPreferredDate ' + info.jobPreferredDate);         
+                
+                job = [select id, Site__c, Engineer__c, Sales_Source__c, Order__c, ownerid from Job__c where id = :info.jobID];
+                
+                Contact c = [select id, AccountId from contact where id = :info.contactId];
+                
+                if (!String.isEmpty(info.jobPreferredDate)) {
+                    job.Preferred_Date__c = date.valueof(info.jobPreferredDate);
+                }
+                
+                if (!String.isEmpty(info.jobScheduledDate)) {
+                    job.Booked_Date__c = date.valueof(info.jobScheduledDate);
+                    job.Status__c = bg_Constants.JOB_STATUS_SCHEDULED;
+                }
+                
+                // Time
+                if (!String.isEmpty(info.jobPreferredTime)) {
+                    Integer hrs = Integer.valueof(info.jobPreferredTime.SubStringBefore(':'));
+                    Integer mm  = Integer.valueOf(info.jobPreferredTime.SubstringAfter(':'));
+                    job.Preferred_Time__c = Time.newInstance(hrs, mm, 0, 0);                
+                }
+                
+                if (!String.isEmpty(info.jobScheduledTime)) {
+                    Integer hrs = Integer.valueof(info.jobScheduledTime.SubStringBefore(':'));
+                    Integer mm  = Integer.valueOf(info.jobScheduledTime.SubstringAfter(':'));
+                    job.Booked_Time__c = Time.newInstance(hrs, mm, 0, 0);    
+                }                    
+                
+                update job;
+                
+                if (info.engineerRequest) {
+                    createEngineerRequest(job.ownerid, job.id, c.AccountId, c.Id, job.Order__c);
+                }                
+                
+            } catch (Exception e) {
+                System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+                throw new ODSConstants.ODSException(Label.ODS_EX_In_Job_Updating);
+            }
+        }
+        
+        return job.id;
+    }        
+    
+    /*
+     * 20200617 MC
+     * Get or Create the owner of the vehicle
+     */
+    private void ownerCreateOrRetrieve(ODSCreatePlanning.CreatePlanningRequest planning) {
+        System.debug('ODSPlanner.ownerCreateOrRetrieve');
+        
+        Boolean updateOwnerData = true;
+        if (String.isEmpty(planning.ownerID)) {
+            
+            List<Account> accList = [select id, Type, Default_Order_Contact__c, Credit_Limit__c, Credit_Remaining__c, Phone, Renewal_Cancellation_Requested__c, Name from Account where (Vat_Code__c != '' AND Vat_Code__c = :planning.ownerVATCode)  OR (Account.Fiscal_Code__c != '' AND Account.Fiscal_Code__c = :planning.ownerFiscalCode)];
+            List<Contact> conList = new List<Contact>();
+
+            setOwnerRecordTypes(planning);
+            
+            if (accList != null && accList.size()> 0) {
+                ownerAccount = accList[0];
+            } else {
+                ownerAccountCreation(planning);
+                updateOwnerData = false;
+            }
+
+            if (!String.isEmpty(planning.ownerFiscalCode)) {
+                conList = [select id, AccountId, phone, HomePhone, Email_Not_Provided__c, Email from Contact where Account.Fiscal_Code__c = :planning.ownerFiscalCode];
+            } else {
+                conList = [select id, AccountId, phone, HomePhone, Email_Not_Provided__c, Email from Contact where id = :ownerAccount.Default_Order_Contact__c];
+            }            
+
+            if (conList != null && conList.size()> 0) {
+                ownerContact = conList[0];
+            } else {
+                ownerContactCreation(planning);
+                updateOwnerData = false;
+            }
+            
+        } else {
+            try {
+                System.debug('ODSPlanner.ownerCreateOrRetrieve owner retrieve');
+                ownerAccount = [SELECT id, Type,Renewal_Cancellation_Requested__c, Default_Order_Contact__c, Credit_Limit__c, Credit_Remaining__c, Phone FROM Account WHERE id = :planning.OwnerId];
+                ownerContact = [SELECT id, AccountId, phone, HomePhone, Email_Not_Provided__c, Email FROM Contact WHERE id = :ownerAccount.Default_Order_Contact__c];
+            } catch(Exception e) {
+                System.debug('Exception: ' + e.getMessage());
+                throw new ODSConstants.ODSException(Label.ODS_EX_Owner_Not_Found);
+            }
+        }
+        if (updateOwnerData) {
+            updateOwnerData(planning);
+        }
+    }
+
+    /*
+     * 20210824 MC
+     * Update owner if exists
+     */
+    private void updateOwnerData(ODSCreatePlanning.CreatePlanningRequest planning) {
+        if(ownerAccount.Phone != planning.ownerPhone) {
+            ownerAccount.Phone = planning.ownerPhone;
+            update ownerAccount;
+        }
+        
+        try {
+            if(ownerContact.phone != ownerAccount.Phone ){
+                ownerContact.phone  = ownerAccount.Phone;
+                ownerContact.HomePhone = ownerAccount.Phone;
+            }
+            if(String.isEmpty(planning.ownerEmail)){
+                ownerContact.Email_Not_Provided__c = true;
+                ownerContact.Email = null;
+            }else if(ownerContact.Email != planning.ownerEmail){
+                ownerContact.Email_Not_Provided__c = false;
+                ownerContact.Email = planning.ownerEmail;
+            }
+            
+            Update ownerContact;
+        } catch(Exception e) {
+            
+        }            
+    }
+    
+    /*
+     * 20200617 MC
+     * Get the Account/Contact record types
+     */  
+    private void setOwnerRecordTypes(ODSCreatePlanning.CreatePlanningRequest planning) {            
+        System.debug('ODSPlanner.setOwnerRecordTypes');          
+        if (planning.ownerType.toUpperCase().equals(bg_Constants.ODS_OWNER_TYPE_PRIVATE)) {
+            // Final Customer
+            accountType = bg_Constants.ACCOUNT_TYPE_RETAIL;
+            revenueChannel = bg_Constants.REVENUE_CHANNEL_RETAIL;
+            accountRecordTypeId = [select id from recordtype where sobjecttype = :bg_Constants.OBJECT_TYPE_ACCOUNT and DeveloperName = :bg_Constants.RECORDTYPE_ACCOUNT_RETAIL_CUSTOMER].Id;
+            contactRecordTypeId = [select id from recordtype where sobjecttype = :bg_Constants.OBJECT_TYPE_CONTACT and DeveloperName = :bg_Constants.RECORDTYPE_CONTACT_RETAIL_CUSTOMER].Id;                
+        } else if (planning.ownerType.toUpperCase().equals(bg_Constants.ODS_OWNER_TYPE_SELF_EMPLOYED)) {
+            // Freelance Customer
+            accountType = bg_Constants.ACCOUNT_TYPE_CORPORATE;
+            revenueChannel = bg_Constants.REVENUE_CHANNEL_RETAIL;
+            accountRecordTypeId = [select id from recordtype where sobjecttype = :bg_Constants.OBJECT_TYPE_ACCOUNT and DeveloperName = :bg_Constants.RECORDTYPE_ACCOUNT_SELF_EMPLOYED_CUSTOMER].Id;
+            contactRecordTypeId = [select id from recordtype where sobjecttype = :bg_Constants.OBJECT_TYPE_CONTACT and DeveloperName = :bg_Constants.RECORDTYPE_CONTACT_CORPORATE_CUSTOMER].Id;            
+        }else if (planning.ownerType.toUpperCase().equals(bg_Constants.ODS_OWNER_TYPE_CORPORATE)) {
+            // Corporate Customer
+            accountType = bg_Constants.ACCOUNT_TYPE_CORPORATE;
+            revenueChannel = bg_Constants.REVENUE_CHANNEL_CORPORATE;
+            accountRecordTypeId = [select id from recordtype where sobjecttype = :bg_Constants.OBJECT_TYPE_ACCOUNT and DeveloperName = :bg_Constants.RECORDTYPE_ACCOUNT_CORPORATE_CUSTOMER].Id;
+            contactRecordTypeId = [select id from recordtype where sobjecttype = :bg_Constants.OBJECT_TYPE_CONTACT and DeveloperName = :bg_Constants.RECORDTYPE_CONTACT_CORPORATE_CUSTOMER].Id;
+        } else {
+            throw new ODSConstants.ODSException(Label.ODS_EX_Invalid_Owner_Type);
+        }
+    }
+    
+    /*
+     * 20200617 MC
+     * Create the Account owner of the vehicle
+     */        
+    private void ownerAccountCreation(ODSCreatePlanning.CreatePlanningRequest planning) {
+        System.debug('ODSPlanner.ownerAccountCreation');
+        try {
+            ownerAccount = new Account(RecordTypeId = accountRecordTypeId);
+            ownerAccount.Name = planning.ownerFirstName + planning.ownerLastName;
+            
+            ownerAccount.Vat_Code__c = planning.ownerVATCode;
+            ownerAccount.Fiscal_Code__c  = planning.ownerFiscalCode;
+            
+            ownerAccount.BillingStreet = planning.ownerStreet;
+            ownerAccount.BillingCity = planning.ownerCity;
+            ownerAccount.BillingPostalCode = planning.ownerZipCode;
+            ownerAccount.BillingState = planning.ownerState;
+            ownerAccount.BillingCOuntry  = planning.ownerCountry;
+            
+            ownerAccount.Phone = planning.ownerPhone;
+            
+            ownerAccount.SDI_Enabled__c = true;
+            ownerAccount.Revenue_Channel__c = revenueChannel;
+            
+            ownerAccount.SDI_Code__c = planning.ownerSDICode;
+            ownerAccount.PEC_Email__c = planning.ownerPEC;
+            
+            ownerAccount.OwnerId = planning.accountOwnerId;
+            ownerAccount.Renewal_Cancellation_Requested__c=true;
+            ownerAccount.vs_code__c = planning.ownerMemberId;
+            ownerAccount.Credit_Limit__c = 0; //DX-104 Instalments fix
+            ownerAccount.Type = accountType; //DX-109, will throw exception on Record Type determinaiton stage (accountRecordTypeId)
+            
+            insert ownerAccount;
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            throw new ODSConstants.ODSException(Label.ODS_EX_Owner_Creation);
+        }        
+    }
+    
+    /*
+     * 20200617 MC
+     * Create the Contact owner of the vehicle
+     */        
+    private void ownerContactCreation(ODSCreatePlanning.CreatePlanningRequest planning) {
+        System.debug('ODSPlanner.ownerContactCreation');
+        try {
+            ownerContact  = new Contact(RecordTypeId = contactRecordTypeId);
+            ownerContact.firstName = planning.ownerFirstName;
+            ownerContact.lastName = planning.ownerLastName;
+            
+            if (planning.ownerType.toUpperCase().equals(bg_Constants.ODS_OWNER_TYPE_CORPORATE)) {
+                ownerContact.firstName = bg_Constants.DEFAULT_CONTACT_FIRST_NAME + ' ' + bg_Constants.DEFAULT_CONTACT_LAST_NAME;
+                ownerContact.lastName = ownerAccount.Name;
+            }            
+            
+            ownerContact.MailingStreet = planning.ownerStreet;
+            ownerContact.MailingCity  = planning.ownerCity;
+            ownerContact.MailingPostalCode  = planning.ownerZipCode;
+            ownerContact.MailingState  = planning.ownerState;
+            ownerContact.MailingCountry = planning.ownerCountry;
+            
+            ownerContact.HomePhone = planning.ownerPhone;
+            ownerContact.Phone = planning.ownerPhone;
+            ownerContact.MobilePhone = planning.ownerMobilePhone;
+            
+            if (String.isEmpty(planning.ownerEmail)) {
+                ownerContact.Email_Not_Provided__c = true;
+            } else {
+                ownerContact.Email_Not_Provided__c = false;
+                ownerContact.Email = planning.ownerEmail;
+            }
+            
+            ownerContact.OwnerId = planning.accountOwnerId;
+            
+            ownerContact.AccountId = ownerAccount.id;
+            insert ownerContact;
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            throw new ODSConstants.ODSException(Label.ODS_EX_Owner_Creation);
+        }
+    }    
+    
+    /*
+     * 20200617 MC
+     * Get or Create the vehicle
+     */       
+    private void vehicleCreateOrRetrieve(ODSCreatePlanning.CreatePlanningRequest planning) {
+        System.debug('ODSPlanner.vehicleCreateOrRetrieve');
+        if (String.isEmpty(planning.vehicleID)) {
+            List<Vehicle__c> vehicles = [select id, Vehicle_Type__c, Make__c, Model__c, Colour__c, Current_Active_Vehicle_Ownership__c from Vehicle__c where (VIN__C != '' AND VIN__C = :planning.vehicleVin)];
+            
+            if (vehicles == null || vehicles.size() < 1) {
+                vehicleCreation(planning);
+            } else {
+                vehicle = vehicles[0];
+            }
+        } else {
+            try {
+                vehicle = [select id, Current_Active_Vehicle_Ownership__c from Vehicle__c where id = :planning.vehicleID];
+            } catch(Exception e) {
+                System.debug('Exception: ' + e.getMessage());
+                throw new ODSConstants.ODSException(Label.ODS_EX_Vehicle_Not_Found);
+            }
+        }
+        System.debug('vehicle.Id ' + vehicle.Id);
+        vehicleOwnershipCreateOrRetrieve(planning, ownerContact, vehicle);
+    }
+    
+    /*
+     * 20200617 MC
+     * Create the vehicle
+     */   
+    private void vehicleCreation(ODSCreatePlanning.CreatePlanningRequest planning) {
+        System.debug('ODSPlanner.vehicleCreation');
+        try {
+            
+            Schema.DescribeFieldResult F = Vehicle__c.Colour__c.getDescribe();
+            String vehicleColor = truncateString(planning.vehicleColor, F);
+            
+            vehicle = new Vehicle__c();
+            vehicle.VIN__c = planning.vehicleVin;
+            vehicle.VRM__c = planning.vehiclePlate;
+            vehicle.Make__c = planning.vehicleMake;
+            vehicle.Vehicle_Type__c = planning.vehicleType;
+            vehicle.Model__c = planning.vehicleModel;
+            vehicle.Colour__c = vehicleColor;
+            vehicle.ownerid = planning.accountOwnerId;
+            
+            if (!String.isEmpty(planning.vehicleModelYear)) {
+                vehicle.Model_Year__c = decimal.valueOf(planning.vehicleModelYear);
+            }
+            
+            insert vehicle;
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            throw new ODSConstants.ODSException(Label.ODS_EX_Vehicle_Creation);
+        }
+    }
+    
+    /*
+     * 20200526 MC
+     * Get or Create the VehicleOwnerShip between the Vehicle and the Contact
+     * passed as parameters. 
+     */
+    private void vehicleOwnershipCreateOrRetrieve(ODSCreatePlanning.CreatePlanningRequest planning, Contact contact, Vehicle__c vehicle) {
+        System.debug('ODSPlanner.vehicleOwnershipCreateOrRetrieve');
+        System.debug('contact.Id ' + contact.Id);
+        System.debug('vehicle.Id ' + vehicle.Id);        
+        try {
+            /* 
+            Commented in order to create a VO only the first time. We're not aware about who is the real V. Owner
+            List<Vehicle_Ownership__c> vehicleOwnerships = [select id from Vehicle_Ownership__c where (Contact__c = :contact.Id AND Vehicle__c = :vehicle.id)];
+            */
+            List<Vehicle_Ownership__c> vehicleOwnerships = [select id, contact__c from Vehicle_Ownership__c where Vehicle__c = :vehicle.id
+                                                            order by Is_Current_Ownership__c desc];
+            
+            if (vehicleOwnerships == null || vehicleOwnerships.size() < 1 || vehicleOwnerships[0].contact__c != contact.id) {
+                createVehicleOwnership(planning, contact, vehicle);
+            } else {
+                vehicleOwnership = vehicleOwnerships[0];
+                if (planning.insurancePolicyNumber != null && !String.isEmpty(planning.insurancePolicyNumber)) {
+                    vehicleOwnership.Insurance_Policy_Number__c = planning.insurancePolicyNumber;            
+                    update vehicleOwnership;
+                }   
+            }
+            
+            if (vehicle.Current_Active_Vehicle_Ownership__c == null && vehicleOwnership != null && vehicleOwnership.id != null) {
+                vehicle.Current_Active_Vehicle_Ownership__c = vehicleOwnership.Id;
+                update vehicle;
+            }
+            
+            if (planning.ewPhone != null && !String.isEmpty(planning.ewPhone)) {
+                createVehicleContact(planning.ewPhone);
+            }
+            
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            throw new ODSConstants.ODSException(Label.ODS_EX_Vehicle_Ownership_not_Found);
+        }
+    }
+    
+    /*
+     * 20200526 MC
+     * Create a VehicleOwnerShip between the Vehicle and the Contact
+     * passed as parameters. 
+     */
+    private void createVehicleOwnership(ODSCreatePlanning.CreatePlanningRequest planning, Contact contact, Vehicle__c vehicle) {
+        System.debug('ODSPlanner.createVehicleOwnership');
+        try {
+            vehicleOwnership = new Vehicle_Ownership__c();
+            vehicleOwnership.Account__c = contact.AccountId;
+            vehicleOwnership.Contact__c = contact.Id;
+            vehicleOwnership.Start_Date__c = System.today();
+            vehicleOwnership.Vehicle__c = vehicle.id;
+            vehicleOwnership.ownerid = planning.accountOwnerId;
+            if(planning.insurancePolicyNumber != null) vehicleOwnership.Insurance_Policy_Number__c = planning.insurancePolicyNumber;
+            
+            insert vehicleOwnership;
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            throw new ODSConstants.ODSException(Label.ODS_EX_Vehicle_Ownership_Creation);
+        }
+    }
+    
+    /*
+     * 20210210 MC
+     * Create a VehicleContact useful in Early Warning
+     */
+    private void createVehicleContact(String ewNumber) {
+        System.debug('ODSPlanner.createVehicleContact');
+        try {
+            List<Vehicle_Contact__c> vehicleContacts = [select id from Vehicle_Contact__c 
+                                                        where First_Name__c = :bg_Constants.EARLY_WARNING_CONTACT_FIRST_NAME
+                                                        and Last_Name__c =  :bg_Constants.EARLY_WARNING_CONTACT_LAST_NAME
+                                                        and Phone__c = :ewNumber
+                                                        and Vehicle_Ownership__c = :vehicleOwnership.id];
+            
+            System.debug('ODSPlanner.createVehicleContact vehicleContacts.size ' + vehicleContacts.size());
+            if (vehicleContacts == null || vehicleContacts.size() == 0) {
+                Vehicle_Contact__c vehicleContact = new Vehicle_Contact__c();
+                vehicleContact.First_Name__c = bg_Constants.EARLY_WARNING_CONTACT_FIRST_NAME;
+                vehicleContact.Last_Name__c = bg_Constants.EARLY_WARNING_CONTACT_LAST_NAME;
+                vehicleContact.Phone__c = ewNumber;
+                vehicleContact.Vehicle_Ownership__c = vehicleOwnership.id;
+                vehicleContact.Priority__c = 1;
+                
+                insert vehicleContact;
+            }
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            throw new ODSConstants.ODSException(Label.ODS_EX_Vehicle_Contact_Creation);
+        }
+    }    
+    
+    /*
+     * 20200617 MC
+     * Create a draft subscription 
+     */    
+    private void subscriptionCreation(ODSCreatePlanning.CreatePlanningRequest planning) {
+        System.debug('ODSPlanner.subscriptionCreation');
+        try {
+            System.debug('subscription.opportunity.Revenue_Channel__c; ' +opportunity.Revenue_Channel__c);
+            System.debug('subscription.ownerAccount.Id; ' +ownerAccount.Id);
+            System.debug('subscription.ownerContact; ' +ownerContact);
+            
+            //Id subscriptionID = [select id from Product2 where id = :planning.subscriptionCode].Id;
+            subscription = new Subscription__c();
+            
+            if (planning.engineerRequest != null && planning.engineerRequest) {
+                subscription.Status__c = bg_Constants.SUBSCRIPTION_STATUS_DRAFT;
+            } else {
+                subscription.Status__c = bg_Constants.SUBSCRIPTION_STATUS_PENDING_ACTIVATION;
+            }
+            
+            subscription.Account__c = ownerAccount.Id;
+            subscription.Contact__c = ownerContact.Id;
+            subscription.Vehicle_Ownership__c = vehicleOwnership.Id;
+            subscription.Product__c = subscriptionProduct.id;
+            subscription.Revenue_Channel__c = opportunity.Revenue_Channel__c;
+            subscription.Order__c = order.id;
+            subscription.Order_Product__c = orderItemMap.get(subscriptionProduct.Id);
+            subscription.Source__c = bg_Constants.CASE_ORIGIN_ODS;
+            subscription.Owner__c = planning.accountOwnerId;
+            subscription.Bypass_Activation_Checks__c = true;
+            subscription.Is_Free_Subscription__c = opportunity.Is_Free_Subscription__c;
+            
+            subscription.Sales_Source__c = reseller.Id;
+            subscription.Renewal_Cancellation_Requested__c=opportunity.Renewal_Cancellation_Requested__c;
+            subscription.Requester__c = planning.requesterID;//reseller.Id;
+            //subscription.Prevent_Sub_Activation_On_Job_Complete__c = originOpportunity.Prevent_Sub_Activation_On_Job_Complete__c; //DX-109
+            
+            if (job != null) {
+                // in case of renewal
+                subscription.Job__c = job.Id;
+            }
+
+            if (isTriangulation) {
+                subscription.Requester__c = reseller.Id;
+                subscription.Sales_Source__c = accountSalesSourceId;
+            }
+            
+            System.debug('subscription.Duration_Months__c ' + subscription.Duration_Months__c);
+            
+            try {
+                if (isSubsCustomLength) {
+                    subscription.Duration_Months__c = subsCustomLength;
+                } else {
+                    subscription.Duration_Months__c = subscriptionProduct.Period_In_Months__c;
+                }
+            } catch (Exception e) {
+                System.debug('Exception: ' + e.getMessage());
+                System.debug('ODSPlanner.subscriptionCreation invalid Duration_Months__c');
+            }
+            
+            insert subscription;
+            
+            // DX-93
+            if (triangulationOrder != null) { updJobOrSubTriangulationMap.put(subscription.Id,subscription); }
+            
+            additionalServicesCreation(subscription);
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            throw new ODSConstants.ODSException(Label.ODS_EX_Subscription_Creation);
+        }
+    }
+    
+    /*
+     * 20200617 MC
+     * Create a draft job 
+     */    
+    private void jobCreation(ODSCreatePlanning.CreatePlanningRequest planning) {
+        System.debug('ODSPlanner.jobCreation');
+        try {
+            /*
+            Id productID = [select Product2.Id from OpportunityLineItem 
+            where OpportunityId =  :opportunity.id
+            and Product2.Family = :bg_Constants.PRODUCT_CATEGORY_JOB 
+            and Product2.Job_Type__c = :bg_Constants.JOB_TYPE_INSTALL limit 1].Product2.Id;
+            */
+            if (job == null) {
+                job = new Job__c();
+            }
+            
+            job.Status__c = bg_Constants.JOB_STATUS_DRAFT;
+            if (planning.engineerRequest != null && planning.engineerRequest) {
+                job.Is_Engineer_Required__c = true;
+            } 
+            /*
+            else {
+            job.Status__c = bg_Constants.JOB_STATUS_SCHEDULED;
+            job.Installer__c = reseller.Id;
+            }
+            */
+            
+            job.Account__c = ownerAccount.Id;
+            job.Contact__c = ownerContact.Id;
+            job.Sales_Source__c = reseller.Id;
+            job.Vehicle__c = vehicle.id;
+            job.product__c = jobProduct.id;
+            job.Order__c = order.id;
+            job.Revenue_Channel__c = opportunity.Revenue_Channel__c;
+            job.Order_Product__c = orderItemMap.get(jobProduct.id);
+            job.Source__c = bg_Constants.CASE_ORIGIN_ODS;
+            job.ownerid = planning.accountOwnerId;
+            job.Is_Grouped_Job__c = opportunity.Jobs_Grouping__c;
+            job.Is_Hold_Stock_Movement__c = opportunity.Is_Hold_Stock_Movement__c;
+            job.Is_Performed_by_Customer__c = opportunity.Is_Job_Performed_by_Customer__c;
+            job.Suggested_Position__c = planning.jobSuggestedPosition;
+            if(planning.poNumber != null) job.Customer_PO_Number__c = planning.poNumber;
+            
+            // Date
+            if (planning.jobPreferredDate != null && !String.isEmpty(planning.jobPreferredDate)) {
+                job.Preferred_Date__c = date.valueof(planning.jobPreferredDate); 
+            }
+            
+            if (planning.jobScheduledDate != null && !String.isEmpty(planning.jobScheduledDate)) {
+                job.Booked_Date__c = date.valueof(planning.jobScheduledDate);
+                job.Status__c = bg_Constants.JOB_STATUS_SCHEDULED;
+            }
+            
+            // Time
+            if (planning.jobPreferredTime != null && !String.isEmpty(planning.jobPreferredTime)) {
+                Integer hrs = Integer.valueof(planning.jobPreferredTime.SubStringBefore(':'));
+                Integer mm  = Integer.valueOf(planning.jobPreferredTime.SubstringAfter(':'));
+                job.Preferred_Time__c = Time.newInstance(hrs, mm, 0, 0);                
+            }
+            
+            if (planning.jobScheduledTime != null && !String.isEmpty(planning.jobScheduledTime)) {
+                Integer hrs = Integer.valueof(planning.jobScheduledTime.SubStringBefore(':'));
+                Integer mm  = Integer.valueOf(planning.jobScheduledTime.SubstringAfter(':'));
+                job.Booked_Time__c = Time.newInstance(hrs, mm, 0, 0);    
+            }
+            
+            job.Requester__c = planning.requesterID;
+            
+            insert job;
+            
+            // DX-93
+            if (triangulationOrder != null) { updJobOrSubTriangulationMap.put(job.Id,job); }
+            
+            if (planning.engineerRequest != null && planning.engineerRequest) {
+                createEngineerRequest(planning.accountOwnerId, job.id, reseller.Id, null, order.id);
+            }
+            
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            throw new ODSConstants.ODSException(Label.ODS_EX_Job_Creation);
+        }
+    }
+    
+    /*
+     * DX 107 - 20210118 MC
+     * Create a draft deinstall job 
+     */       
+    private void deinstallJobCreation(ODSCreateDeinstallPlanning.CreateDeinstallPlanningRequest planning) {
+        System.debug('ODSPlanner.odsDeistallOrderCreation');
+        ODSCreatePlanning.CreatePlanningRequest jobPlanning = new ODSCreatePlanning.CreatePlanningRequest();
+        
+        jobPlanning.engineerRequest  = planning.engineerRequest;
+        jobPlanning.accountOwnerId =  planning.accountOwnerId;
+        jobPlanning.jobPreferredDate = planning.jobPreferredDate;
+        jobPlanning.jobScheduledDate = planning.jobScheduledDate;
+        jobPlanning.jobPreferredTime = planning.jobPreferredTime;
+        jobPlanning.jobScheduledTime = planning.jobScheduledTime;
+        jobPlanning.requesterID = planning.requesterID;
+        
+        jobCreation(jobPlanning);
+    }
+    
+    /*
+     * 20200618 MC
+     * Create the Order
+     */        
+    private void odsOrderCreation(ODSCreatePlanning.CreatePlanningRequest planning) {
+        System.debug('ODSPlanner.odsOrderCreation');
+        try {
+            order = bg_OrderUtils.CreateOrder(ownerAccount.Id, opportunity.CurrencyIsoCode, bg_Constants.ORDER_STATUS_DRAFT, ownerContact.Id, date.today());
+            order.OpportunityID = opportunity.Id;
+            order.Pricebook2Id = pricebookID;
+            order.Sales_Source__c = reseller.Id;
+            order.Origin__c = bg_Constants.CASE_ORIGIN_ODS;
+            order.ownerid = planning.accountOwnerId;
+            order.PoNumber = planning.poNumber;
+            // Italy fields
+            order.Vat_Rate__c = opportunity.Vat_Rate__c;
+            order.Invoice_Time__c = opportunity.Invoice_Time__c;
+            order.Is_Unit_Rental__c = opportunity.Is_Unit_Rental__c;
+            if (originOpportunity.Is_Items_Order__c == false 
+                && originOpportunity.Subsidiary_fx__c == bg_constants.USER_SUBSIDIARY_LJIT
+               ){
+                   order.Is_All_Inclusive__c = true;
+               }
+            order.Payment_Terms__c = opportunity.Payment_Terms__c;
+            order.Invoice_Grouping__c = opportunity.Invoice_Grouping__c;
+            order.Invoice_Product_Group__c = opportunity.Invoice_Product_Group__c;
+            order.Invoice_Split__c = opportunity.Invoice_Split__c;
+            order.Invoice_Instalments_Split__c = opportunity.Invoice_Instalments_Split__c;
+            order.Revenue_Channel__c = opportunity.Revenue_Channel__c;
+            order.Payment_Type__c = opportunity.Payment_Type__c;
+            order.Is_Triangulation__c = isTriangulation;
+            order.Use_Instalment_Aggregation__c = reseller.Use_Instalment_Aggregation__c;
+            
+            //DX-109
+            if(ownerAccount.Type != null && ownerAccount.Type == bg_Constants.ACCOUNT_TYPE_RETAIL){
+                order.Type = bg_Constants.ORDER_TYPE_RETAIL;
+            } else {
+                order.Type = bg_Constants.ORDER_TYPE_CORPORATE; // Set Default
+            }
+            if(order.Payment_Type__c == null){
+                order.Payment_Type__c = bg_Constants.ORDER_PAYMENT_TYPE_SINGLE; // Set Default
+            }
+            if (isSplitPayment) {
+                order.Split_Subscription_Payment__c = splitPayment;
+                order.Payment_Type__c = bg_Constants.ORDER_PAYMENT_TYPE_SPLIT; //DX-109
+            }
+            //DX-109 End
+            
+            totalSubAmount = 0;
+            totalNonSubAmount = 0;
+            
+            if (triangulationOrder != null) {
+                order.Is_Triangulation__c = true;
+                order.Triangulation_Order__c = triangulationOrder.Id;
+            }
+            
+            // Can Check Opp.New_Order_Type__c
+            if (reseller.RecordType.DeveloperName  == bg_Constants.RECORDTYPE_ACCOUNT_CORPORATE_CUSTOMER) {
+                order.Type = bg_Constants.ORDER_TYPE_CORPORATE;
+            } else if (reseller.RecordType.DeveloperName  == bg_Constants.RECORDTYPE_ACCOUNT_DEALER_CUSTOMER) {
+                order.Type = bg_Constants.ORDER_TYPE_DEALER_SALE;
+            } else if (reseller.RecordType.DeveloperName  == bg_Constants.RECORDTYPE_ACCOUNT_RETAIL_CUSTOMER) {
+                order.Type = bg_Constants.ORDER_TYPE_RETAIL;
+            }
+
+            if (opportunity.BU_Grouping_Enabled__c == true && !String.isEmpty(planning.odsContactID)) {
+                order.Business_Unit_Name__c = [select id, Business_Unit_Name__c
+                                                from Contact where id = :planning.odsContactID]
+                                                .Business_Unit_Name__c;
+            }
+            
+            insert order;
+            
+            if (isPackage) {
+                packagePropositions();
+            } else {
+                productPropositions();
+            }
+            
+            //setupPromoPlanning();
+            //searchForPromotion();
+            
+            //setPayment();
+            
+        } catch (Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            throw new ODSConstants.ODSException(Label.ODS_EX_Order_Creation);            
+        }
+    }
+    
+    /*
+     * DX 107 - 20210119 MC
+     * Create a draft deinstall order 
+     */        
+    private void odsDeistallOrderCreation(ODSCreateDeinstallPlanning.CreateDeinstallPlanningRequest planning) {
+        System.debug('ODSPlanner.odsDeistallOrderCreation');
+        ODSCreatePlanning.CreatePlanningRequest orderPlanning = new ODSCreatePlanning.CreatePlanningRequest();
+        
+        orderPlanning.accountOwnerId = planning.accountOwnerId;
+        
+        odsOrderCreation(orderPlanning);
+    }
+    
+    /*
+     * 20201210 MC
+     * Add product proposition
+     */        
+    private void productPropositions() {
+        System.debug('ODSPlanner.productPropositions');
+        oliList = 
+            [SELECT   Id, ListPrice, Product2id, PriceBookEntryId, Pricebook__c, UnitPrice, OpportunityId, 
+             Product2.Lifecycle__c, Product2.Period_In_Months__c, Product2.Family
+             FROM    OpportunityLineItem 
+             WHERE   OpportunityId = :opportunity.id
+             AND     (Product2.Id in :productIDSToSearch
+                      OR   Product2.Family = :bg_Constants.PRODUCT_CATEGORY_ADDITIONAL_SERVICE
+                     )
+            ];
+        
+        System.debug('odsOrderCreation.oliList.size() ' + oliList.size());
+        System.debug('odsOrderCreation.isTriangulation ' + isTriangulation);
+        if (isTriangulation) {
+            System.debug('odsOrderCreation.triangulationOpportunityId ' + triangulationOpportunityId);
+            System.debug('odsOrderCreation.Product2.Id ' + subscriptionProduct.Id);                
+            oliList.addAll(
+                [SELECT Id, ListPrice, Product2id, PriceBookEntryId, Pricebook__c, UnitPrice, OpportunityId, 
+                 Product2.Lifecycle__c, Product2.Period_In_Months__c, Product2.Family
+                 FROM    OpportunityLineItem 
+                 WHERE   OpportunityId = :triangulationOpportunityId
+                 AND     (Product2.Id = :subscriptionProduct.Id
+                          OR   Product2.Family = :bg_Constants.PRODUCT_CATEGORY_ADDITIONAL_SERVICE
+                         )
+                ]);
+        }
+        System.debug('odsOrderCreation.oliList.size()2 ' + oliList.size());
+        
+        prop = addOrderProposition(order.Id, opportunity.CurrencyIsoCode);
+        // DX-104 just get first Unit, if there are more than one Unit Type, it's not possible to get right without altering API
+        List<OpportunityLineItem> oliUnitList = 
+            [SELECT Id, Product2Id, OpportunityId, Product2.Family
+             FROM  OpportunityLineItem
+             WHERE OpportunityId = :opportunity.id
+             AND   Product2.Family = :bg_Constants.PRODUCT_CATEGORY_UNIT
+             LIMIT 1];
+        if(oliUnitList.size() == 1 && oliUnitList[0].Product2Id != null){
+            prop.Expected_Unit_Product__c = oliUnitList[0].Product2Id; // DX-104 BIA adding new ProductId
+        }
+        // DX-104 End
+        
+        insert prop;
+        prop = addProductOrderItems(prop, order.id, opportunity.currencyIsoCode, 0, 0);
+    }
+    
+    /*
+     * 20201210 MC
+     * Add package proposition
+     */        
+    private void packagePropositions() {
+        System.debug('ODSPlanner.packagePropositions');
+        
+        oliList = new List<OpportunityLineItem>();
+        oliList.add(packageOLI);
+        
+        System.debug('odsOrderCreation.oliList.size() ' + oliList.size());        
+        
+        prop = addOrderProposition(order.Id, opportunity.CurrencyIsoCode);
+        prop.product__c = packageOLI.Product2.Id;
+        insert prop;
+        addPackageOrderItems(prop, order.id, opportunity.currencyIsoCode);
+    }
+    
+    /*
+     * 202009076 MC
+     * Add the proposition and the items to an order
+     */          
+    private Order_Proposition__c addOrderProposition(String oId, String currencyIsoCode) {
+        System.debug('ODSPlanner.addOrderProposition');
+        //Order_Proposition__c newProp = bg_OrderUtils.CreateOrderProposition(order.Id, oli.Product2id, oli.UnitPrice, oli.UnitPrice, opportunity.CurrencyIsoCode);
+        prop = bg_OrderUtils.CreateOrderProposition(oId, null, null, null, currencyIsoCode);
+        prop.Vehicle__c = vehicle.Id;
+        prop.Sales_Price__c = 0; //oli.UnitPrice;
+        prop.List_Price__c = 0; //oli.ListPrice;
+        
+        if (originOpportunity.Invoice_Time__c == bg_Constants.INVOICE_TIME_MANUAL) {
+            prop.Release_to_Oracle__c = bg_Constants.RELEASE_TO_ORACLE_ON_HOLD;
+        }
+        
+        return prop;
+    }
+    
+    /*
+     * 202009076 MC
+     * Add product items to an order
+     */
+    private Order_Proposition__c addProductOrderItems(Order_Proposition__c oProp, String oId, String currencyIsoCode, Decimal lPrice, Decimal sPrice) {
+        System.debug('ODSPlanner.addProductOrderItems');
+        
+        orderItemMap = new Map<Id,Id>();
+        
+        List<OrderItem> orderItemList = new List<OrderItem>();
+        
+        Decimal packListPrice = lPrice;
+        Decimal packSalesPrice = sPrice;
+        
+        System.debug('ODSPlanner.addOrderItems oliList.size() ' + oliList.size());
+        for (OpportunityLineItem oli : oliList) {
+            
+            Decimal itemSalesPrice = oli.UnitPrice;
+            Decimal adjustedListPrice = 0;
+            Boolean setAdjustedListPrice = false;
+            
+            if (!String.isEmpty(oli.OpportunityId) && (oli.OpportunityId == triangulationOpportunityId)) {
+                itemSalesPrice = 0;
+                System.debug(oli.Product2Id + ' change price to ' + itemSalesPrice);
+            }
+            
+            if (oli.Product2id != null
+                && oli.Product2.Family != null
+                && ((oli.Product2.Family == bg_Constants.PRODUCT_CATEGORY_JOB && opportunity.Is_Job_Performed_by_Customer__c)
+                    || (oli.Product2.Family == bg_Constants.PRODUCT_CATEGORY_SUBSCRIPTION && opportunity.Is_Free_Subscription__c)
+                    || (oli.Product2.Family == bg_Constants.PRODUCT_CATEGORY_SUBSCRIPTION && unitExchangeWithoutAdditionalYears)
+                    || (oli.Product2.Family == bg_Constants.PRODUCT_CATEGORY_SUBSCRIPTION && changeVOWithoutAdditionalYears)
+                    || (oli.Product2.Family == bg_Constants.PRODUCT_CATEGORY_UNIT && opportunity.Is_Free_Unit__c)
+                   )
+               ) {
+                   itemSalesPrice = 0;
+                   System.debug(oli.Product2Id + ' is a Job, Sub or Unit free, change price to ' + itemSalesPrice);                
+               }
+            
+            if (oli.ListPrice == null) {
+                // when the unit is defined in pricebook only
+                packListPrice = oli.UnitPrice + packListPrice;
+            } else {
+                packListPrice = oli.ListPrice + packListPrice;
+            }
+            
+            try{
+                if (isSubsCustomLength && oli.Product2id != null && oli.Product2.Family != null && oli.Product2.Family == bg_Constants.PRODUCT_CATEGORY_SUBSCRIPTION) {
+                    itemSalesPrice = itemSalesPrice*subsCustomLength;
+                    adjustedListPrice = oli.listPrice*subsCustomLength; // oli.listPrice - will work only for Items Orders, fine for Italy so far
+                    setAdjustedListPrice = true;
+                }
+            } catch(Exception e){
+                System.debug('costexception:');
+            }
+            
+            OrderItem newOrderItem = bg_OrderUtils.CreateOrderItem(oId, oli.PriceBookEntryId, oProp.Id, 1, itemSalesPrice);
+            newOrderItem.Product2Id = oli.Product2id;
+            
+            if (setAdjustedListPrice) {
+                newOrderItem.Adjusted_List_Price__c = adjustedListPrice;
+                packListPrice = (adjustedListPrice - oli.ListPrice) + packListPrice; // Minus required as we have counted unadjusted List price
+            }
+            
+            orderItemList.add(newOrderItem);
+            
+            packSalesPrice = newOrderItem.UnitPrice + packSalesPrice;
+            
+            if (oli.Product2id != null && oli.Product2.Family != null &&
+                (oli.Product2.Family == bg_Constants.PRODUCT_CATEGORY_SUBSCRIPTION)
+               ) {
+                   totalSubAmount += newOrderItem.UnitPrice;
+               } else {
+                   totalNonSubAmount += newOrderItem.UnitPrice;
+               }
+            
+            /*
+            //Promo
+            if (promoMap.get(oli.Product2Id) != null) {
+            System.debug('Find promo for ' + oli.Product2Id);
+            Promotion__c promo = promoMap.get(oli.Product2Id);
+            Decimal discount = 0;
+
+            if (promo.Is_Free__c) {
+
+            } else {
+
+            }
+
+            /*
+            if (discountProduct.Discount__r.Is_Percentage__c) {
+            discount = ((itemSalesPrice*discountProduct.Discount__r.Value__c)/100);
+            } else {
+            discount = itemSalesPrice - discountProduct.Discount__r.Value__c;
+            }
+
+            if (discount <= itemSalesPrice) {
+            System.debug('Discount: ' + discount);
+            discount = (discount*(-1)).setScale(2);
+            System.debug('Discount: ' + discount);
+
+            OrderItem discountOrderItem = bg_OrderUtils.CreateOrderItem(oId, oli.PriceBookEntryId, oProp.Id, 1, discount);
+            discountOrderItem.Product2Id = oli.Product2id;
+            orderItemList.add(discountOrderItem);
+
+            salesPrice = salesPrice + discount;
+            }
+            }
+            */
+        }
+        
+        insert orderItemList;
+        
+        for (OrderItem oi : orderItemList) {
+            orderItemMap.put(oi.Product2id, oi.Id);
+        }
+        
+        oProp.Sales_Price__c = packSalesPrice;
+        oProp.List_Price__c = packListPrice;
+        update oProp;
+        //newprop.Sales_Price__c = oli.UnitPrice;
+        //newProp.List_Price__c = oli.ListPrice;
+        
+        //setPayment();
+        
+        return oProp;
+    }
+    
+    /*
+     * 202009076 MC
+     * Add package product items to an order
+     */             
+    private void addPackageOrderItems(Order_Proposition__c oProp, String oId, String currencyIsoCode) {
+        System.debug('ODSPlanner.addPackageOrderItems');
+        
+        orderItemMap = new Map<Id,Id>();
+        
+        List<OrderItem> orderItemList = new List<OrderItem>();
+        
+        System.debug('ODSPlanner.addPackageOrderItems opportunity.pricebook2.Product_Price_Book__c ' + opportunity.pricebook2.Product_Price_Book__c);
+        for (PricebookEntry pbe : [select id, product2id, unitprice, Product2.Family
+                                   from pricebookentry 
+                                   where pricebook2id = :pricebookID
+                                   and Product2Id in :productIDSToSearch]) {
+                                       
+            Decimal up = 0;
+            
+            System.debug('ODSPlanner.addPackageOrderItems packageOLI.UnitPrice ' + packageOLI.UnitPrice);
+            System.debug('ODSPlanner.addPackageOrderItems packageOLI.ListPrice ' + packageOLI.ListPrice);
+            if(packageOLI.UnitPrice == packageOLI.ListPrice) {
+                up = pbe.UnitPrice;
+            } else if (pbe.Product2.Family == bg_Constants.PRODUCT_CATEGORY_SUBSCRIPTION) {
+                up = packageOLI.UnitPrice;
+            } else if (pbe.Product2.Family == bg_Constants.PRODUCT_CATEGORY_JOB) {
+                up = packageOLI.UnitPrice;
+            }
+            
+            OrderItem newOrderItem = bg_OrderUtils.CreateOrderItem(oId, pbe.Id, oProp.Id, 1, up);
+            newOrderItem.Product2Id = pbe.Product2id;
+            orderItemList.add(newOrderItem);
+                                       
+            /*
+            if (pbe.Product2id != null && pbe.Product2.Family != null &&
+            (pbe.Product2.Family == bg_Constants.PRODUCT_CATEGORY_SUBSCRIPTION)
+            ) {
+            totalSubAmount += pbe.UnitPrice;
+            } else {
+            totalNonSubAmount += pbe.UnitPrice;
+            }
+            */
+        }
+        
+        insert orderItemList;
+        
+        for (OrderItem oi : orderItemList) {
+            orderItemMap.put(oi.Product2id, oi.Id);
+        }
+        
+        oProp.Sales_Price__c = packageOLI.UnitPrice;
+        oProp.List_Price__c = packageOLI.ListPrice;
+        update oProp;
+        //newprop.Sales_Price__c = oli.UnitPrice;
+        //newProp.List_Price__c = oli.ListPrice;
+        
+        //setPayment();
+    }
+    
+    /*
+     * 20201207 MC
+     * Retrieve promotions
+     */
+    private void searchForPromotion() {
+        System.debug('retrievePromo ' + searchForPromo);
+        
+        if (searchForPromo) {
+            PromotionsHandler promotionsHandler = new PromotionsHandler();
+            PromotionsHandler.PromotionResponse response = promotionsHandler.manageProductPromotions(promoRequest);
+            
+            if (response.additionalSubCreated) {
+                subscription.SubPerUnitNumber__c = 1;
+                update subscription;
+            }
+        }
+    }
+    
+    /*
+     * 20201207 MC
+     * Setup search Promo during planning
+     */    
+    private void setupPromoPlanning() {
+        promoRequest = new PromotionsHandler.PromotionRequest();
+        
+        productsIds = new Set<String>();
+        productsIds.add(subscriptionProduct.ProductCode);
+        productsIds.add(jobProduct.ProductCode);      
+        
+        promoRequest.accountID = ownerAccount.Id;
+        promoRequest.contactID = ownerContact.Id;
+        promoRequest.order = order;
+        promoRequest.salesSourceID = reseller.Id;
+        promoRequest.productsIds = productsIds;
+        promoRequest.vehicle = vehicle;
+        promoRequest.subsidiary = bg_Constants.USER_SUBSIDIARY_LJIT;
+        
+        promoRequest.subscription = subscription;
+        
+        if (isPackage) {
+            searchForPromo = false;
+        } else {
+            searchForPromo = true;
+        }
+    }
+    
+    /*
+     * 20200701 MC
+     * Manage the payment
+     */        
+    private void setPayment() {
+        Set<Id> ordersIds = new Set<Id>();
+        List<Instalment_Header__c> ihList = new List<Instalment_Header__c>();
+        List<Subscription_Payment__c> spList = new List<Subscription_Payment__c>();
+        
+        Map<Id, Payment__c> paymentsById;
+        String paymentType = bg_Constants.PAYMENT_TYPE_INVOICE;
+        
+        paymentsList = new List<Payment__c>();
+        
+        ordersIds.add(order.id);
+        paymentsById = bg_PaymentUtils.GetPaymentsForOrderIDs(ordersIds);
+        
+        if (opportunity.Receipt_Method__c == bg_Constants.RECEIPT_METHOD_CREDIT_CARD) {
+            paymentType = bg_Constants.PAYMENT_TYPE_CARD;
+        }
+        //DX-124 ODS fix: commented out below; no DD, only Invoice
+        // else if (opportunity.Receipt_Method__c == bg_Constants.RECEIPT_METHOD_DIRECT_DEBIT) {
+        //    paymentType = bg_Constants.PAYMENT_TYPE_DIRECT_DEBIT;
+        //}
+        
+        //order.Payment_Type__c = opportunity.Payment_Type__c;
+        
+        System.debug('setPayment opportunity.Payment_Type__c ' + opportunity.Payment_Type__c);
+        System.debug('setPayment isSplitPayment ' + isSplitPayment);
+        if (isSplitPayment){
+            //order.Payment_Type__c = opportunity.Payment_Type__c;
+            //update order; // no point to do the same again
+            
+            createSplitPayment(paymentsById, paymentType);
+            if(subscription != null) spList.add(createSubscriptionPayment(subPayment, subscription));
+        } else {
+            for (Id key : paymentsById.keySet()) {
+                Payment__c payment = paymentsById.get(key);
+                
+                /*if (isSplitPayment && payment.isSubscription__c) {
+                payment.Instalment_Frequency__c = opportunity.Split_Payment__c;
+                //payment.Is_Instalment__c = true;
+                //payment.Is_First_Instalment__c = true;
+                payment.Bill_Frequency__c = bg_Constants.PAYMENT_FREQUENCY_ONCE;
+                payment.Instalment_Request_Record__c = true;
+
+                //ihList.add(createIstalmentHeader(reseller.Id, payment, opportunity.Split_Payment__c, totalSubAmount));
+                spList.add(createSubscriptionPayment(payment, subscription));
+                }*/
+                if(subscription != null) spList.add(createSubscriptionPayment(payment, subscription)); // should be just one
+                
+                payment.Status__c = bg_Constants.PAYMENT_STATUS_DRAFT;
+                payment.Account__c = reseller.Id;
+                
+                payment.Type__c = paymentType;
+                payment.Compound_Payment_Type__c = getCompoundPaymentType(false);
+                
+                paymentsList.add(payment);     
+            }
+        }
+        
+        // DX-109
+        if(subscription != null || job != null){
+            if(job != null) prop.Has_Job__c = true; 
+            if(subscription != null) prop.Has_Subscription__c = true;
+            update prop;
+        }
+        // 
+        
+        //insert ihList;
+        if(spList.size() > 0) insert spList;
+        
+        update paymentsList;
+        
+        //DX-111 commented as uselecc update //DX-104 Instalments fix; DX-109 DON'T start Credit Check
+        //if(opportunity.Split_Payment__c != null && instalmentHeader != null){
+        //    instalmentHeader.Status__c = bg_Constants.INSTALMENT_HEADER_STATUS_NEW; //INSTALMENT_HEADER_STATUS_AWAITING_CREDIT_CHECK
+        //    update instalmentHeader;
+        //}
+    }
+    
+    /*
+     * 20201202 MC
+     * Manage split payment
+     */
+    private void createSplitPayment(Map<Id, Payment__c> paymentsById, String paymentType) {
+        System.debug('createSplitPayment');
+        List<Payment__c> paymentsToDelete = new List<Payment__c>();
+        //List<Subscription_Payment__c> subPaymentList = new List<Subscription_Payment__c>();
+        //List<Instalment_Header__c> instalmentsList = new List<Instalment_Header__c>();
+        
+        subPayment = createPayment(paymentType, totalSubAmount, true, true);
+        paymentsList.add(subPayment);
+        
+        nonSubPayment = createPayment(paymentType, totalNonSubAmount, false, false);  
+        paymentsList.add(nonSubPayment);
+        
+        for (Id key : paymentsById.keySet()) {
+            paymentsToDelete.add(paymentsById.get(key));
+        }
+        
+        System.debug('createSplitPayment paymentsToDelete.size() ' + paymentsToDelete.size());
+        System.debug('createSplitPayment paymentsList.size() ' + paymentsList.size());
+        
+        delete paymentsToDelete;
+        insert paymentsList;
+        
+        // Setup Split with Instalments, only if Instalements are required
+        if(opportunity.Split_Payment__c != null){
+            instalmentHeader = createIstalmentHeader(reseller.Id, subPayment, opportunity.Split_Payment__c, totalSubAmount);
+            instalmentHeader.Remaining_Credit__c = (reseller.Credit_Remaining__c == null) ? 0 : reseller.Credit_Remaining__c; //DX-104 Instalments fix DX-126
+            instalmentHeader.Status__c = bg_Constants.INSTALMENT_HEADER_STATUS_NEW; //DX-111
+            insert instalmentHeader;
+            
+            subPayment.Instalment_Header__c = instalmentHeader.id;
+            subPayment.Amount__c = 0;
+        }
+        
+        update subPayment;
+    }
+    
+    /*
+     * 20201202 MC
+     * Create payment
+     */
+    private Payment__c createPayment(String paymentType, Decimal amount, Boolean isInstalment, Boolean isSub) {
+        System.debug('createPayment ' + paymentType + ' ' + amount + ' ' + isInstalment);
+        Payment__c payment = new Payment__c();
+        payment.Order__c = order.id;
+        payment.Type__c = paymentType;
+        payment.CurrencyIsoCode = order.CurrencyIsoCode;
+        payment.Amount__c = amount;
+        payment.Status__c = bg_Constants.PAYMENT_STATUS_DRAFT;
+        payment.Account__c = reseller.Id;
+        payment.isSubscription__c = isSub;
+        
+        payment.Compound_Payment_Type__c = getCompoundPaymentType(isSub);
+        
+        //payment.Collection_Date__c = date.today();
+        //payment.Payment_Due_Date__c = date.today();
+        
+        if (isInstalment) {
+            payment.Instalment_Frequency__c = opportunity.Split_Payment__c;
+            //payment.Is_Instalment__c = true;
+            //payment.Is_First_Instalment__c = true; // this is header payment, not first Installment
+            payment.Bill_Frequency__c = bg_Constants.PAYMENT_FREQUENCY_ONCE;
+            payment.Instalment_Request_Record__c = true;
+        }
+        // DX-124 DD should not come here
+        // else {
+        //    if (paymentType == bg_Constants.PAYMENT_TYPE_DIRECT_DEBIT) {
+        //        payment.Type__c = bg_Constants.PAYMENT_TYPE_INVOICE;
+        //    }
+        //}
+        
+        return payment;
+    }
+    
+    private String getCompoundPaymentType(Boolean isSubscription) {
+        return order.Type + ' ' + order.Payment_Type__c + ' ' + isSubscription+' '+bg_Constants.USER_SUBSIDIARY_LJIT; //TODO Subsidiary need to be taken from running user
+    }
+    
+    /*
+     * 20201202 MC
+     * Create Subs Payment
+     */        
+    private Subscription_Payment__c createSubscriptionPayment(Payment__c p, Subscription__c s) {
+        Subscription_Payment__c sp = new Subscription_Payment__c(
+            Payment__c = p.id,
+            Subscription__c = s.id
+        );
+        
+        return sp;
+    }
+    
+    /*
+     * 20201202 MC
+     * Create Instalment header
+     */        
+    private Instalment_Header__c createIstalmentHeader(String accountID, Payment__c p, String frequency, Decimal amount) {
+        Instalment_Header__c ih = new Instalment_Header__c(
+            Account__c = accountID,
+            Order__c = order.id,
+            Originating_Payment_Record__c = p.id,
+            Payment_Frequency__c = frequency,
+            Status__c = bg_Constants.INSTALMENT_HEADER_STATUS_NEW,
+            Total_Instalment_Amount__c = amount
+        );
+        
+        return ih;
+    }
+    
+    /*
+     * 20200702 MC
+     * Attach additional services
+     */
+    private void additionalServicesCreation(Subscription__c s) {
+        System.debug('additionalServicesCreation');
+        asList = new List<Additional_Service__c>();
+        
+        if (oliList == null) {
+            return;
+        }
+        
+        for (OpportunityLineItem o : oliList) {
+            if (o != null && o.Product2.Family == bg_Constants.PRODUCT_CATEGORY_ADDITIONAL_SERVICE) {
+                asList.add(getAS(s, o));
+            }
+        }
+        
+        insert asList;
+    }
+    
+    private Additional_Service__c getAS(Subscription__c s, OpportunityLineItem oli) {
+        
+        Id orderProductId = orderItemMap.get(oli.Product2.Id);
+        
+        return new Additional_Service__c(
+            Order__c = order.id,
+            Order_Product__c = orderProductId,
+            Product__c = oli.Product2.Id,
+            Status__c  =  bg_Constants.ADDITIONAL_SERVICE_STATUS_DRAFT,
+            Subscription__c = s.id
+        );        
+    }
+    
+    /*
+     * 20200827 MC
+     * Retrieve the list of the products. 
+     */        
+    public List<OpportunityLineItem> getProducts(ODSgetContracts.GetContractsRequest contractsRequest) {
+        System.debug('ODSPlanner.getProducts');
+        List<OpportunityLineItem> optProducts = new List<OpportunityLineItem>();
+        
+        contractsRequest.stageName = bg_Constants.OPPORTUNITY_STAGE_CLOSED_ACTIVE;
+        contractsRequest.subsidiary = bg_Constants.USER_SUBSIDIARY_LJIT;
+        
+        // Triangulation
+        try {
+            optProducts.addAll([select id, 
+                                name, 
+                                opportunity.contract.id, 
+                                opportunity.contract.contractnumber, 
+                                opportunity.contract.name, 
+                                Product2Id, 
+                                Product2.ProductCode, 
+                                Product2.Name, 
+                                Product2.family, 
+                                Product2.period_in_months__c,
+                                Product2.Telematics_Subscription_Type__c,
+                                Product2.Variable_Period_In_Months__c,
+                                Product2.Job_Type__c, 
+                                Opportunity.Id, 
+                                Opportunity.Account.Id, 
+                                Opportunity.Account.Name, 
+                                Opportunity.Account.type, 
+                                Opportunity.Account.Member_id__c,
+                                Opportunity.Is_Frontispiece_Required__c,
+                                Opportunity.Is_Insurance_Policy_Number_Required__c,
+                                Opportunity.Change_VO_Mode__c
+                                from OpportunityLineItem 
+                                where Opportunity.StageName = :bg_Constants.OPPORTUNITY_STAGE_CLOSED_WON
+                                and Opportunity.Subsidiary_fx__c = :contractsRequest.subsidiary 
+                                and OpportunityId in ( select Triangulation__c 
+                                                      from Opportunity 
+                                                      where Opportunity.contract.Accountid = :contractsRequest.accountID
+                                                      and Opportunity.StageName = :contractsRequest.stageName
+                                                      and Opportunity.Subsidiary_fx__c = :contractsRequest.subsidiary )]);
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+        }
+        
+        try {
+            optProducts.addAll([select id, 
+                                name, 
+                                opportunity.contract.id, 
+                                opportunity.contract.contractnumber, 
+                                opportunity.contract.name, 
+                                Product2Id, 
+                                Product2.ProductCode, 
+                                Product2.Name, 
+                                Product2.family, 
+                                Product2.period_in_months__c,
+                                Product2.Telematics_Subscription_Type__c,
+                                Product2.Variable_Period_In_Months__c,
+                                Product2.Job_Type__c,
+                                Opportunity.Id, 
+                                Opportunity.Account.Id, 
+                                Opportunity.Account.Name, 
+                                Opportunity.Account.type, 
+                                Opportunity.Account.Member_id__c ,
+                                Opportunity.Is_Frontispiece_Required__c,
+                                Opportunity.Is_Insurance_Policy_Number_Required__c,
+                                Opportunity.Change_VO_Mode__c
+                                from OpportunityLineItem 
+                                where Opportunity.contract.Accountid = :contractsRequest.accountID
+                                and Opportunity.StageName = :contractsRequest.stageName
+                                and Opportunity.Subsidiary_fx__c = :contractsRequest.subsidiary]);
+        } catch (Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+        }
+        
+        return optProducts;
+    }
+    
+    /*
+     * 20200907 MC
+     * Finalize the installation and add the device to the order 
+     */
+    public void completeInstallation(ODSSetDevice.SetDeviceRequest setDeviceRequest, Boolean createCase) {
+        System.debug('ODSPlanner.completeInstallation');
+        
+        Order_Proposition__c prop;
+        
+        try {
+            job = 
+                [SELECT Id, Order__r.OpportunityId, Order__r.Is_Unit_Rental_fx__c,
+                 Order__r.Opportunity.Invoice_Time__c, Order__r.Opportunity.CurrencyIsoCode, 
+                 Order__r.Opportunity.Is_Additional_Device__c, Order__r.Opportunity.Is_Free_Unit__c, Order__r.Opportunity.Triangulation__c,
+                 Order__r.Id, Order__r.Pricebook2Id, Order__r.Is_All_Inclusive__c, 
+                 Order__r.Is_Triangulation__c, Order__r.Sales_Source__c,
+                 Sales_Source__r.Id, Sales_Source__r.Default_Order_Contact__r.AccountId,
+                 Vehicle__r.id, Order_Product__r.Order_Proposition__r.Expected_Unit_Product__c,
+                 Vehicle__r.Vehicle_Type__c,  Vehicle__r.Make__c, Vehicle__r.Model__c,
+                 Vehicle__r.Colour__c, Vehicle__r.Current_Active_Vehicle_Ownership__c,
+                 Order_Product__r.Order_Proposition__r.Id,
+                 Order_Product__r.Order_Proposition__r.Release_To_Oracle__c,
+                 Order_Product__r.Order_Proposition__r.Product__r.Family,
+                 Order_Product__r.Order_Proposition__r.Sales_Price__c,
+                 Order_Product__r.Order_Proposition__r.List_Price__c,
+                 Contact__r.Id, Installer__c, Revenue_Channel__c, Is_Grouped_Job__c
+                 FROM    Job__c WHERE id = :setDeviceRequest.jobID];
+            
+            
+            List<Unit__c> uList = [SELECT Id, Product__r.Id, Order__c, Order_Product__c, Product__r.Family, Unit_Type__c, CurrencyIsoCode, Serial_Number_Validation__c
+                                   FROM    Unit__c 
+                                   WHERE   Serial_Number__c = :setDeviceRequest.serial
+                                   AND     Status__c <> :bg_Constants.UNIT_STATUS_INSTALLED];
+            
+            if (uList != null && uList.size() == 1) {
+                System.debug('completeInstallation. Just one unit');
+                unit = uList.get(0);
+            } else {
+                for (Unit__c u1 : uList) {
+                    unit = u1;
+                    if (u1.currencyIsoCode == bg_Constants.CURRENCY_CODE_EUR) {
+                        System.debug('completeInstallation. More than one unit, but found a EUR one');
+                        break;
+                    }
+                }
+            }
+            
+            /*
+            unit = 
+            [SELECT Id, Product__r.Id, Order__c, Order_Product__c, Product__r.Family, Unit_Type__c, Is_Free_Unit__c
+            FROM    Unit__c 
+            WHERE   Serial_Number__c = :setDeviceRequest.serial
+            AND     currencyIsoCode = :bg_Constants.CURRENCY_CODE_EUR
+            AND     Status__c <> :bg_Constants.UNIT_STATUS_INSTALLED];
+            */
+            
+            if (unit == null) {
+                String unitLocation = setDeviceRequest.unitLocation;
+                if (String.isEmpty(unitLocation)) {
+                    unitLocation = bg_Constants.UNIT_LOCATION_UNKNOWN;
+                }
+
+                unit = new Unit__c();
+                unit.Status__c = bg_Constants.UNIT_STATUS_DRAFT; 
+                unit.Serial_Number__c = setDeviceRequest.serial;      
+                unit.Serial_Number_Validation__c = bg_Constants.UNIT_SERIAL_NUMBER_VALIDATION_ENGINEER_ONLY;
+                unit.Unit_Type__c = bg_Constants.UNIT_TYPE_UNK;
+                unit.Unit_Location__c = unitLocation;
+                insert unit;
+            }
+            
+            Contact engineer = [select id, Last_Installation__c, Engineer_Code__c from contact where id = :setDeviceRequest.engineerID];
+            
+            prop = job.Order_Product__r.Order_Proposition__r;
+            vehicle = job.Vehicle__r;  
+            order = job.Order__r;
+            reseller = job.Sales_Source__r;
+            ownerContact = job.Contact__r;
+            opportunity = job.Order__r.Opportunity; // DX-124
+            
+            //if(vehicle == null){
+            //    System.debug('BIA Vehicle is not set');
+            //List<Vehicle__c> vehicleList = [SELECT Id, Vehicle_Type__c, Make__c, Model__c, Colour__c, Current_Active_Vehicle_Ownership__c 
+            //FROM Vehicle__c
+            //WHERE VRM__c = :];
+            //if(vehicleList.size() == 1){
+            //    vehicle = vehicleList[0];
+            //}
+            //}
+            
+            System.debug('completeInstallation JobProdFamily: ' + job.Order_Product__r.Order_Proposition__r.Product__r.Family);
+            Boolean payForUnit = payForUnit(unit.id, job.Order__r.Is_Unit_Rental_fx__c, job.Order_Product__r.Order_Proposition__r.Product__r.Family);
+            // DX-124
+            if(opportunity != null && opportunity.Is_Free_Unit__c == true){
+                payForUnit = false;
+            }
+            System.debug('ODSPlanner.completeInstallation payForUnit ' + payForUnit);
+            // TODO FIX unit.Product__r.Id - may be missing, but it's widely used below
+            if (payForUnit) {
+                System.debug('BIA ODSPlanner order.Pricebook2Id:'+order.Pricebook2Id);
+                System.debug('BIA ODSPlanner unit.Product__r.Id:'+unit.Product__r.Id);
+                Id productId = unit.Product__r.Id; // DX-104
+                if(productId == null){
+                    productId = job.Order_Product__r.Order_Proposition__r.Expected_Unit_Product__c;
+                    unit.Product__c = productId;
+                    System.debug('BIA ODSPlanner INSERT productId:'+productId);
+                }
+                
+                //DX-124 Does not look like thi piece of code is used anywhere
+                oliList = [SELECT   Id, ListPrice, Product2id, PriceBookEntryId, Pricebook__c, UnitPrice, OpportunityId, 
+                           Product2.Lifecycle__c, Product2.Period_In_Months__c, Product2.Family
+                           FROM    OpportunityLineItem 
+                           WHERE   OpportunityId = :job.Order__r.OpportunityId
+                           AND     Product2.Id = :productId
+                           LIMIT 1];
+                
+                if (oliList == null || oliList.size() <= 0) {
+                    PricebookEntry pbe = [
+                        SELECT  Id, Product2id, Product2.Family, UnitPrice, Pricebook2Id 
+                        FROM    PricebookEntry 
+                        WHERE   Pricebook2Id = :order.Pricebook2Id
+                        AND     Product2Id = :productId];
+                    
+                    if (pbe == null) {
+                        caseSuggestedSolution = bg_Constants.CASE_SUGGESTED_SOLUTION_ADD_UNIT_TO_PB;
+                        caseAutoResolution = bg_Constants.CASE_AUTO_RESOLUTION_ADD_UNIT;
+                        throw new ODSConstants.ODSException(Label.ODS_EX_Unit_Not_Found);
+                    }
+                    oliList.add(new OpportunityLineItem(
+                        Product2id = pbe.Product2id,
+                        PriceBookEntryId = pbe.Id, 
+                        UnitPrice = pbe.UnitPrice,
+                        OpportunityId = job.Order__r.OpportunityId
+                    ));
+                }
+                
+                totalSubAmount = 0;
+                totalNonSubAmount = 0;
+                
+                prop = addProductOrderItems(prop, order.Id, job.Order__r.Opportunity.CurrencyIsoCode, 
+                                            job.Order_Product__r.Order_Proposition__r.List_Price__c,
+                                            job.Order_Product__r.Order_Proposition__r.Sales_Price__c);
+                
+                unit.Order__c = job.Order__r.Id;     
+                if (orderItemMap != null && orderItemMap.size() > 0) {
+                    unit.Order_Product__c = orderItemMap.get(unit.Product__r.id);
+                }
+                
+                //order.Source_Inventory__c = bg_Constants.LJITEXT;
+                //order.Source_Sub_Inventory__c = setDeviceRequest.engineerID;
+                //update order; //WHY?
+            }
+            
+            unit.Status__c = bg_Constants.UNIT_STATUS_INSTALLED;       
+            unit.Vehicle__c = job.Vehicle__r.Id;
+            unit.Unit_Location__c = setDeviceRequest.unitLocation;
+            
+            if (unit.Serial_Number_Validation__c <> bg_Constants.UNIT_SERIAL_NUMBER_VALIDATION_ENGINEER_ONLY) {
+                unit.Serial_Number_Validation__c = bg_Constants.UNIT_SERIAL_NUMBER_VALIDATION_VALID;
+            }
+
+            unit.Revenue_Channel__c = job.Revenue_Channel__c;
+            unit.Has_Active_Subscription__c = true; //greacy hack
+            unit.Is_Unit_Rental__c = job.Order__r.Is_Unit_Rental_fx__c;
+            unit.Is_Additional_Device__c = job.Order__r.Opportunity.Is_Additional_Device__c;
+            //if(unit.){ unit. = 'UNK'; } // DX-104
+            System.debug('BIA ODSPl unit.Vehicle__c:'+unit.Vehicle__c);
+            System.debug('BIA ODSPl unit.Unit_Location__c:'+unit.Unit_Location__c);
+            System.debug('BIA ODSPl unit.Serial_Number_Validation__c:'+unit.Serial_Number_Validation__c);
+            System.debug('BIA ODSPl unit.Unit_Type__c:'+unit.Unit_Type__c);
+            
+            if(opportunity != null) unit.Is_Free_Unit__c = opportunity.Is_Free_Unit__c; //DX-124
+            
+            //job.Status__c = bg_Constants.JOB_STATUS_COMPLETE; //DO this Later
+            job.Engineer__c = setDeviceRequest.engineerID;
+            job.Engineer_Code__c = engineer.Engineer_Code__c;
+            
+            if (job.Installer__c == null) {
+                job.Installer__c = [select AccountId from Contact where id = :setDeviceRequest.engineerID].AccountId;
+            }
+            
+            job.Site__c = setDeviceRequest.siteID;
+            job.Unit__c = unit.Id;
+            
+            System.debug('checkinstallationDate2 ' + setDeviceRequest.installationDate);
+            if (!String.isEmpty(setDeviceRequest.installationDate)) {
+                Date installationDate = date.valueof(setDeviceRequest.installationDate);
+                System.debug('checkinstallationDate2 ' + installationDate);
+                job.Completed_Date__c = installationDate;
+                unit.Installation_Date__c = installationDate;
+                
+                if (engineer.Last_Installation__c == null || engineer.Last_Installation__c < installationDate) {
+                    engineer.Last_Installation__c = installationDate;
+                }
+                engineer.Engineer_Code__c = engineer.Engineer_Code__c;               
+            }
+            
+            if (!String.isEmpty(setDeviceRequest.completedTime)) {
+                Integer hrs = Integer.valueof(setDeviceRequest.completedTime.SubStringBefore(':'));
+                Integer mm  = Integer.valueOf(setDeviceRequest.completedTime.SubstringAfter(':'));
+                job.Completed_TIme__c = Time.newInstance(hrs, mm, 0, 0);    
+            }
+            
+            Job__c groupedJob = findGroupedJob(job, unit, vehicle);
+            if (groupedJob != null) {
+                System.debug('Set groupedjob ' +groupedJob.Id);
+                
+                job.Grouped_Job__c = groupedJob.Id;
+                unit.Is_Grouped_Unit__c = true;
+                unit.Grouped_Unit__c=groupedJob.Unit__r.id;
+            }
+            
+            if (unitSoli != null &&
+                unitSoli.Order__r.Create_Stock_Order_fx__c == bg_Constants.OPPORTUNITY_CREATE_STOCK_ORDER_STOCK &&
+                job.Order__r.Opportunity.Triangulation__c != null) {
+                    order.Triangulation_Order__c = unitSoli.Order__c;
+                    order.Is_Triangulation__c = true;
+                    update order;
+                }
+            
+            update unit;
+            update job;
+            update vehicle;
+            update engineer;
+            
+            try {
+                vehicleOwnership = [Select id from Vehicle_Ownership__c where id = :job.Vehicle__r.Current_Active_Vehicle_Ownership__c];
+                vehicleOwnership.Has_An_Active_Subscription__c = true;
+                
+                if (setDeviceRequest.insurancePolicyNumber != null && !String.isEmpty(setDeviceRequest.insurancePolicyNumber)) {
+                    vehicleOwnership.Insurance_Policy_Number__c = setDeviceRequest.insurancePolicyNumber;            
+                }
+                
+                update vehicleOwnership;
+            } catch (Exception e) {
+                System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            }
+            
+            if (job.Order__r.Opportunity.Invoice_Time__c == bg_Constants.INVOICE_TIME_ACTIVATION_TIME) {
+                List<Payment__c> payments = new List<Payment__c>();
+                List<Instalment_Header__c> ihList = new List<Instalment_Header__c>();
+                
+                List<Payment__c> payList = 
+                    [SELECT Id, Status__c, Type__c, Is_Instalment__c, isSubscription__c, 
+                     Instalment_Frequency__c, Instalment_Header__c
+                     FROM Payment__c WHERE Order__c = :job.Order__r.Id]; //, Instalment_Header__r.Status__c
+                for (Payment__c pay : payList) {
+                    pay.Status__c = bg_Constants.PAYMENT_STATUS_PAID;
+                    if(pay.isSubscription__c == true && pay.Instalment_Frequency__c != null){
+                        pay.Amount__c = 0;
+                    } else if(pay.Type__c == bg_Constants.PAYMENT_TYPE_INVOICE) {
+                        pay.Status__c = bg_Constants.PAYMENT_STATUS_PAYMENT_REQUESTED;
+                    }
+                    payments.add(pay);
+                }
+                
+                for (Instalment_Header__c ih : [SELECT id, Status__c FROM Instalment_Header__c where Order__c = :job.Order__r.Id]) {
+                    if(ih.Status__c != bg_Constants.INSTALMENT_HEADER_STATUS_CONFIRMED){ //DX-104 instalments fix
+                        ih.Status__c = bg_Constants.INSTALMENT_HEADER_STATUS_AWAITING_CREDIT_CHECK;
+                        ihList.add(ih);
+                    }
+                }
+                
+                prop.Release_To_Oracle__c = bg_Constants.RELEASE_TO_ORACLE_RELEASED;
+                update prop;
+                if(payList.size() > 0){
+                    update payments;
+                } else {
+                    // DX-127 set Order to Paid if no Payments found
+                    order.Status = bg_Constants.ORDER_STATUS_PAID;
+                    update order;
+                }
+                System.debug('ihList.size() ' + ihList.size());
+                if(ihList.size() > 0) update ihList;
+                //update order; //WHY?
+                
+            }
+            
+            try {
+                System.debug('Search subscription(S) if exists ' +Job.Order_Product__r.Order_Proposition__r.Id );
+                List<Subscription__c> subs = [select id, name, Duration_Months__c, Start_Date__c, Unit__r.Status__c from subscription__c where job__c = :job.id];
+                System.debug('BIA ODSPl subs:'+subs);
+                if(subs.size() == 0){ //DX-104 Converted Orders fix (not created by ODS API)
+                    subs = [SELECT  Id, name, Duration_Months__c, Start_Date__c, Unit__r.Status__c
+                            FROM    subscription__c 
+                            WHERE   Order__c = :job.Order__c
+                            AND     Order_Product__r.Order_Proposition__c = :job.Order_Product__r.Order_Proposition__r.Id];
+                    System.debug('BIA ODSPl2 subs:'+subs);
+                }
+                //where Order_Product__r.Order_Proposition__c = :Job.Order_Product__r.Order_Proposition__r.Id];ù
+                List<Subscription__c> subsToUpdate = new List<Subscription__c>();
+                System.debug('subs.size() ' + subs.size());
+                
+                for (Subscription__c sub : subs) {
+                    System.debug('Sub ' + sub.id);
+                    
+                    if (sub.Unit__r.Status__c == bg_Constants.UNIT_STATUS_REMOVED) {
+                        // Start/end date of subscription remain
+                        sub.Unit__c = unit.Id; // Link is always required
+                        subsToUpdate.add(sub);
+                    } else {
+                        Date d = System.today();
+                        //sub.Bypass_Activation_Checks__c = true; //may be not required DX-104
+                        sub.Unit__c = unit.Id; // Link is always required
+                        
+                        // Job Completion will setup Start and End Date anyway
+                        if (sub.Start_Date__c == null) {
+                            sub.Start_Date__c = d;
+                            sub.End_Date__c = d.addMonths(Integer.valueOf(sub.Duration_Months__c)).addDays(-1);
+                        } else {
+                            sub.End_Date__c = sub.Start_Date__c.addMonths(Integer.valueOf(sub.Duration_Months__c)).addDays(-1);
+                        }
+                        
+                        //sub.Status__c = bg_Constants.SUBSCRIPTION_STATUS_ACTIVE; // should be done automatically on Job Completion
+                        
+                        subsToUpdate.add(sub);                        
+                    }
+                }
+                
+                update subsToUpdate;
+            } catch(Exception e) {
+                System.debug('Subscription does not exists');
+                System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            }
+            
+            // Missing Link
+            List<Instalment_Header__c> ihList = [SELECT Id, Recurring_Payment_Header__c, Status__c FROM Instalment_Header__c WHERE Order__c = :job.Order__c];
+            if(ihList.size() == 1 && ihList[0].Recurring_Payment_Header__c == null){
+                // if(Test.isRunningTest()) System.debug('BIA ODSPlanner RPDs '+[SELECT Id, Status__c, Recurring_Payment_Header__c, Subscription__c FROM Recurring_Payment_Detail__c]);
+                //Id subId = subs[0].Id;
+                List<Recurring_Payment_Detail__c> rpdList = [SELECT Id, Status__c, Recurring_Payment_Header__c FROM Recurring_Payment_Detail__c WHERE Subscription__r.Order__c = :job.Order__c ]; // :subId was :job.Order__c 
+                if(rpdList.size() >= 1){
+                    ihList[0].Recurring_Payment_Header__c = rpdList[0].Recurring_Payment_Header__c;
+                    update ihList;
+                    
+                    System.debug('BIA UPD IH:'+ihList);
+                }
+            }
+            
+            System.debug('BIA IH:'+ihList);
+            //System.debug('BIA RPD:'+[SELECT Id, Status__c, Recurring_Payment_Header__c FROM Recurring_Payment_Detail__c WHERE Subscription__r.Order__c = :job.Order__c]);
+            //System.debug('BIA Pay:'+[SELECT Id, Status__c FROM Payment__c WHERE Order__c = :job.Order__c]);
+            //System.debug('BIA Ord:'+[SELECT Id, TotalAmount FROM Order WHERE Id = :job.Order__c]);
+            
+            //DX-104 Finishing Touches
+            job.Status__c = bg_Constants.JOB_STATUS_COMPLETE; // Payment should be Paid
+            update job; // this should Activate Sub too... and if any Instalemtns setup them too
+            
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            
+            try {
+                job.Status__c = bg_Constants.JOB_STATUS_PENDING_REQUEST;
+                if (!String.isEmpty(setDeviceRequest.installationDate)) {
+                    Date installationDate = date.valueof(setDeviceRequest.installationDate);
+                    job.Completed_Date__c = installationDate;             
+                }
+                
+                if (!String.isEmpty(setDeviceRequest.completedTime)) {
+                    Integer hrs = Integer.valueof(setDeviceRequest.completedTime.SubStringBefore(':'));
+                    Integer mm  = Integer.valueOf(setDeviceRequest.completedTime.SubstringAfter(':'));
+                    job.Completed_TIme__c = Time.newInstance(hrs, mm, 0, 0);    
+                }
+                
+                update job;
+            } catch(Exception e1) {
+                System.debug('Exception: ' + e1.getMessage()+' IN ' + e1.getStackTraceString());
+            }
+            
+            try {
+                System.debug('createCase ' + createCase);
+                if (createCase) {
+                    String caseDescription = e.getMessage();
+                    createNoUnitFoundRequest(job.id, job.Sales_Source__r.Id, setDeviceRequest, caseDescription, true);
+                } else {
+                    throw new ODSConstants.ODSException(Label.ODS_EX_Unit_SN_Not_Found);
+                }
+            }
+            catch(Exception e2) {
+                System.debug('Exception: ' + e2.getMessage()+' ON ' + e2.getLineNumber()+' IN ' + e2.getStackTraceString());
+                throw new ODSConstants.ODSException(Label.ODS_EX_Order_Creation);
+            }
+        }
+    }
+    
+    /*
+     * 20210120 MC
+     * Manage cases based on Job_Type
+     * called by bg_Case_BI 
+     */        
+    public void manageODSCase(Case c) {
+        System.debug('manageODSCase ' + c.caseNumber +  ' / ' + c.Reason);
+        if (c.Reason == bg_Constants.CASE_REASON_INSTALLATION_ISSUE) {
+            System.debug('manageODSCase ' + c.caseNumber + ' ' + bg_Constants.CASE_REASON_INSTALLATION_ISSUE);
+            completeInstallationRetryFromCase(c);
+        } else if (c.Reason == bg_Constants.CASE_REASON_DEINSTALLATION_ISSUE) {
+            System.debug('manageODSCase ' + c.caseNumber + ' ' + bg_Constants.CASE_REASON_DEINSTALLATION_ISSUE);
+            completeDeinstallationRetryFromCase(c);
+        }
+    }
+    
+    /*
+     * 20201124 MC
+     * Retry to complete the installation
+     * called by bg_Case_BI 
+     */    
+    public void completeInstallationRetryFromCase(Case c) {
+        System.debug('completeInstallationRetryFromCase ' + c.caseNumber);
+        ODSSetDevice.SetDeviceRequest setDeviceRequest = new ODSSetDevice.SetDeviceRequest();
+        
+        setDeviceRequest.engineerID = c.ContactId;
+        setDeviceRequest.jobID = c.Job__c;
+        setDeviceRequest.serial = c.Serial_Number__c;
+        setDeviceRequest.siteID = c.Site__c;
+        setDeviceRequest.insurancePolicyNumber = c.Insurance_Policy_Number__c;
+        setDeviceRequest.unitLocation = c.Unit_Location__c;
+        
+        if (c.Job_Completed_Date__c != null) {
+            setDeviceRequest.installationDate = String.valueOfGmt(c.Job_Completed_Date__c);
+        }
+        
+        if (c.Job_Completed_Time__c != null) {
+            Datetime d = Datetime.newInstance(System.today(), c.Job_Completed_Time__c);
+            setDeviceRequest.completedTime = d.hour() + ':' + d.minute();
+        }
+        
+        completeInstallation(setDeviceRequest, false);
+    }
+    
+    /*
+     * 20210120 MC
+     * Retry to complete the deinstallation
+     * called by bg_Case_BI 
+     */    
+    public void completeDeinstallationRetryFromCase(Case c) {
+        System.debug('completeInstallationRetryFromCase ' + c.caseNumber);
+        ODSRemoveDevice.RemoveDeviceRequest removeDeviceRequest = new ODSRemoveDevice.RemoveDeviceRequest();
+        
+        removeDeviceRequest.engineerID = c.ContactId;
+        removeDeviceRequest.jobID = c.Job__c;
+        removeDeviceRequest.siteID = c.Site__c;
+        
+        if (c.Job_Completed_Date__c != null) {
+            removeDeviceRequest.deinstallationDate = String.valueOfGmt(c.Job_Completed_Date__c);
+        }
+        
+        if (c.Job_Completed_Time__c != null) {
+            Datetime d = Datetime.newInstance(System.today(), c.Job_Completed_Time__c);
+            removeDeviceRequest.completedTime = d.hour() + ':' + d.minute();
+        }
+        
+        deinstall(removeDeviceRequest, false);
+    }
+    
+    /*
+     * 20201110 MC
+     * Check if the customer has to pay for the unit
+     */      
+    private boolean payForUnit(String unitId, Boolean isUnitRental, String family)  {
+        System.debug('payForUnit');
+        Boolean hasToPay = true;
+        
+        if (!String.isEmpty(family) && family == bg_Constants.PRODUCT_CATEGORY_PROPOSITION) {
+            System.debug('payForUnit ' + family);
+            return false;
+        }
+        
+        // Customer does not pay for rented units
+        if (isUnitRental) {
+            System.debug('payForUnit rented ' + bg_Constants.OPPORTUNITY_CREATE_STOCK_ORDER_TRANSFER);
+            return false;
+        }        
+        
+        try {
+            unitSoli = [
+                SELECT  Id, Order__c, Order__r.Create_Stock_Order_fx__c, Order__r.Sales_Source__c
+                FROM    Stock_Order_Line_Item__c
+                WHERE   Unit__c = :unit.id 
+                AND   currencyIsoCode = :bg_Constants.CURRENCY_CODE_EUR
+                ORDER BY CREATEDDATE DESC
+                LIMIT 1];
+            
+            if(unitSoli.Order__r.Create_Stock_Order_fx__c  == bg_Constants.OPPORTUNITY_CREATE_STOCK_ORDER_STOCK ) {
+                // Customer has already paid
+                hasToPay = false;
+                if(unit.Sales_Source__c == Null && unitSoli.Order__r.Sales_Source__c != Null){
+                    unit.Sales_Source__c = unitSoli.Order__r.Sales_Source__c;
+                }
+                System.debug('payForUnit ' + bg_Constants.OPPORTUNITY_CREATE_STOCK_ORDER_STOCK);
+            } else if(unitSoli.Order__r.Create_Stock_Order_fx__c  == bg_Constants.OPPORTUNITY_CREATE_STOCK_ORDER_TRANSFER ) {
+                unit.Sales_Source__c = job.Sales_Source__c;
+                hasToPay = true;
+                System.debug('payForUnit ' + bg_Constants.OPPORTUNITY_CREATE_STOCK_ORDER_TRANSFER);
+            }
+            
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+        }
+        
+        System.debug('payForUnit ' + hasToPay);
+        return hasToPay;
+    }
+    
+    /*
+     * 20201011 MC
+     * Find grouped Jobs
+     */      
+    private Job__c  findGroupedJob(Job__c j, Unit__c u, Vehicle__c v) {
+        System.debug('findGroupedJob');
+        
+        Job__c grJob = null;
+        
+        try {
+            grJob = [select id,Unit__c, Unit__r.id from Job__c
+                     where status__c = :bg_Constants.JOB_STATUS_COMPLETE
+                     and Is_Grouped_Job__c = true
+                     and Grouped_Job_Completed__c = false
+                     and Vehicle__c = :v.id
+                     and Job_Type__c = :bg_Constants.JOB_TYPE_INSTALL
+                     order by Completed_Date__c desc
+                     limit 1];
+            
+            grJob.Grouped_Job__c = j.id;
+            update grJob;
+            
+            Unit__c grUnit = new Unit__c(id =grJob.Unit__r.id, Is_Grouped_Unit__c = true,Grouped_Unit__c = u.id);
+            update grUnit;            
+            
+        } catch(Exception e) {
+            System.debug('findGroupedJob. No Grouped job found');
+        }
+        
+        return grJob;
+    }
+    
+    /*
+     * 20201012 MC
+     * Attach a document to a job
+     */
+    public void jobAttachment(ODSJobAttachment.JobAttachmentRequest jobAttachmentRequest) {
+        System.debug('jobAttachment ' + jobAttachmentRequest.type);
+        
+        String title = '';
+        
+        if (jobAttachmentRequest.type == ODSJobAttachment.FRONTISPIECE) {
+            title = Label.ODS_EX_FRONTISPIECE;
+        }
+        
+        if (jobAttachmentRequest.type == ODSJobAttachment.JOB_CERT) {
+            title = Label.ODS_EX_Job_Certificate;
+        }
+        
+        System.debug('jobAttachment new ContentVersion');
+        
+        ContentVersion conVer = new ContentVersion();
+        conVer.ContentLocation = 'S'; // S => the document is in Salesforce, E => is external files
+        conVer.PathOnClient = jobAttachmentRequest.filename;
+        conVer.Title = title;
+        conVer.VersionData = EncodingUtil.base64Decode(jobAttachmentRequest.content); // converting your binary string to Blog
+        conVer.isMajorVersion = true;
+        insert conVer;
+        
+        // First get the Content Document Id from ContentVersion Object
+        Id conDoc = [SELECT ContentDocumentId FROM ContentVersion WHERE Id =:conVer.Id].ContentDocumentId;
+        
+        System.debug('create ContentDocumentLink record'); 
+        
+        ContentDocumentLink conDocLink = New ContentDocumentLink();
+        conDocLink.LinkedEntityId = jobAttachmentRequest.jobID; // Specify RECORD ID here i.e Any Object ID (Standard Object/Custom Object)
+        conDocLink.ContentDocumentId = conDoc;  //ContentDocumentId Id from ContentVersion
+        conDocLink.shareType = 'V';
+        insert conDocLink;
+        
+        ContentDistribution cd = new ContentDistribution();
+        cd.Name = 'Test';
+        cd.ContentVersionId = conVer.id;
+        cd.PreferencesAllowViewInBrowser= true;
+        cd.PreferencesLinkLatestVersion=true;
+        cd.PreferencesNotifyOnVisit=false;
+        cd.PreferencesPasswordRequired=false;
+        cd.PreferencesAllowOriginalDownload= true;
+        insert cd;
+        
+        ContentDistribution cd2 = [select id, contentdownloadurl from ContentDistribution where id = :cd.id];
+        
+        job = [select id from Job__c where id = :jobAttachmentRequest.jobID];
+        job.Certificate_Link__c = cd2.contentdownloadurl;
+        update job;
+        
+        /*
+        try {
+        ContentDocumentLink prev = [select id, ContentDocumentId from ContentDocumentLink 
+        where ContentDocument.title = :title
+        and LinkedEntityId in (select id from job__c where id = :jobAttachmentRequest.jobID)];
+
+        prev.ContentDocumentId = conDoc;
+        update prev;
+
+        } catch(Exception e) {
+
+        } 
+        */  
+    }
+        
+    /*
+     * 20200616 MC
+     * Create an Engineer Request case
+     */    
+    private void createEngineerRequest(Id accountOwnerId, Id jobId, Id accountId, Id contactId, Id orderId) {
+        System.debug('ODSPlanner.createEngineerRequest');
+        
+        Case c = getODSCase(bg_Constants.CASE_TYPE_CUSTOMER_SUPPORT);
+        c.reason = bg_Constants.CASE_REASON_ENGINEER_REQUEST;
+        c.subject = bg_Constants.CASE_REASON_ENGINEER_REQUEST;
+        c.Job__c = jobId;
+        c.AccountId = accountId;
+        c.Order__c = orderId;
+        c.ownerid = accountOwnerId;
+        
+        insert c ;
+    }
+    
+    /*
+     * 20200616 MC
+     * Create a case
+     */        
+    public void createODSCase(ODSCreateCase.CreateCaseRequest createCaseRequest) {
+        System.debug('ODSPlanner.createODSCase');
+        
+        Case c = getODSCase(createCaseRequest.type);
+        c.reason = createCaseRequest.reason;
+        c.subject = createCaseRequest.subject;
+        c.Job__c = createCaseRequest.jobId;
+        c.ContactId = createCaseRequest.contactID;
+        c.AccountId = createCaseRequest.accountID;
+        c.Description = createCaseRequest.message;
+        c.Complaint_Reason__c = createCaseRequest.complaintReason;
+        
+        insert c;
+        
+        if (createCaseRequest.reason == bg_Constants.CASE_REASON_ENGINEER_REQUEST) {
+            job = [select id, Is_Engineer_Required__c from job__c where id = :createCaseRequest.jobId];
+            job.Is_Engineer_Required__c = true;
+            update job;
+        }
+    }
+    
+    /*
+     * 20200907 MC
+     * No unit found case
+     */        
+    private void createNoUnitFoundRequest(Id jobId, Id accountId, ODSSetDevice.SetDeviceRequest setDeviceRequest, String message, boolean install) {
+        System.debug('ODSPlanner.createNoUnitFoundRequest');
+        
+        errorMessage = Label.ODS_EX_Case_Creation;
+        Case c = getODSCase(bg_Constants.CASE_TYPE_JOB_CLOSURE);
+        
+        if (install) {
+            c.reason = bg_Constants.CASE_REASON_INSTALLATION_ISSUE;
+        } else {
+            c.reason = bg_Constants.CASE_REASON_DEINSTALLATION_ISSUE;            
+        }
+        
+        c.subject = bg_Constants.CASE_SUBJECT_UNIT_NOT_FOUND;
+        c.Job__c = jobId;
+        c.AccountId = accountId;
+        c.ContactId = setDeviceRequest.engineerID;
+        c.Serial_Number__c = setDeviceRequest.serial;
+        c.description = message;
+        c.Site__c = setDeviceRequest.siteID;
+        c.Insurance_Policy_Number__c = setDeviceRequest.insurancePolicyNumber;
+        c.Unit_Location__c = setDeviceRequest.unitLocation;
+
+        if (unit != null) {
+            c.unit__c = unit.id;
+        }
+        
+        errorMessage = Label.ODS_EX_Invalid_Date_Time;
+        if (!String.isEmpty(setDeviceRequest.installationDate)) {
+            Date i = date.valueof(setDeviceRequest.installationDate);
+            c.Job_Completed_Date__c	= i;               
+        }
+        
+        if (!String.isEmpty(setDeviceRequest.completedTime)) {
+            Integer hrs = Integer.valueof(setDeviceRequest.completedTime.SubStringBefore(':'));
+            Integer mm  = Integer.valueOf(setDeviceRequest.completedTime.SubstringAfter(':'));
+            c.Job_Completed_Time__c = Time.newInstance(hrs, mm, 0, 0);    
+        }          
+        
+        c.Suggested_Solution__c = caseSuggestedSolution;
+        c.Auto_Resolution__c = caseAutoResolution;
+        
+        errorMessage = Label.ODS_EX_Case_Creation;
+        insert c;
+    }
+    
+    /*
+     * 20210120 MC
+     * No unit found case
+     */        
+    private void createNoUnitFoundRequest(Id jobId, Id accountId, ODSRemoveDevice.RemoveDeviceRequest deinstallDeviceRequest, String message, String serial) {
+        System.debug('ODSPlanner.createNoUnitFoundRequest');
+        
+        ODSSetDevice.SetDeviceRequest setDeviceRequest = new ODSSetDevice.SetDeviceRequest();
+        
+        setDeviceRequest.engineerID = deinstallDeviceRequest.engineerID;
+        setDeviceRequest.siteID = deinstallDeviceRequest.siteID;
+        setDeviceRequest.unitLocation = '';
+        setDeviceRequest.installationDate = deinstallDeviceRequest.deinstallationDate;
+        setDeviceRequest.completedTime = deinstallDeviceRequest.completedTime;
+        
+        createNoUnitFoundRequest(jobId, accountId, setDeviceRequest, message, false);
+    }        
+    
+    /*
+     * 20200907 MC
+     * ODS Case creation
+     */        
+    private Case getODSCase(String type) {
+        System.debug('ODSPlanner.getODSCase');
+        AssignmentRule AR = new AssignmentRule();
+        AR = [select id from AssignmentRule where SobjectType = :bg_Constants.CASE_OBJECT and Active = true limit 1];
+        
+        //Creating the DMLOptions for "Assign using active assignment rules" checkbox
+        Database.DMLOptions dmlOpts = new Database.DMLOptions();
+        dmlOpts.assignmentRuleHeader.assignmentRuleId= AR.id;
+        
+        Id recordTypeId = Schema.SObjectType.CASE.getRecordTypeInfosByName()
+            .get(bg_Constants.CASE_RECORDTYPE_SYSTEM).getRecordTypeId();
+        
+        Case c = new Case(Status = bg_Constants.CASE_STATUS_NEW, RecordTypeId = recordTypeId) ;
+        
+        c.origin = bg_Constants.CASE_ORIGIN_ODS;
+        c.type = type;
+        c.setOptions(dmlOpts);
+        
+        return c;
+    }
+    
+    /*
+     * 20200703 MC
+     * return true if the Account Record type needs the contract check at opportunity level
+     */        
+    private Boolean contractCheckNeeded() {
+        if (reseller.RecordType.DeveloperName  == bg_Constants.RECORDTYPE_ACCOUNT_CORPORATE_CUSTOMER) {
+            return true;
+        } else if (reseller.RecordType.DeveloperName  == bg_Constants.RECORDTYPE_ACCOUNT_DEALER_CUSTOMER) {
+            return true;
+        }
+        
+        return false;
+    }
+    
+    /*
+     * DX-107 20210115 MC
+     * Create a draft Deinstall Job
+     */
+    public ODSCreateDeinstallPlanning.CreateDeinstallPlanningResponse createDeinstallPlan(ODSCreateDeinstallPlanning.CreateDeinstallPlanningRequest planning) {
+        System.debug('ODSPlanner.createDeinstallPlan');
+        
+        ODSCreateDeinstallPlanning.CreateDeinstallPlanningResponse response = new ODSCreateDeinstallPlanning.CreateDeinstallPlanningResponse();
+        
+        OpportunityLineItem deinstallOli, installOli;
+        
+        try {
+            setEnabledReseller(planning.salesSourceID);
+            
+            errorMessage = Label.ODS_EX_Opportunity_Not_Well_Formed;
+            setOpportunity(planning.jobOpportunityId);
+            originOpportunity = opportunity.clone();
+            
+            if (contractCheckNeeded()) {
+                if (!opportunity.Has_A_Valid_Contract__c) {
+                    errorMessage = Label.ODS_EX_Invalid_Contract;
+                    throw new ODSConstants.ODSException(Label.ODS_EX_Invalid_Contract);
+                }
+            }            
+            
+            pricebookID = opportunity.Pricebook2Id;
+            
+            errorMessage = Label.ODS_EX_Job_Not_Found;
+            Job__c installationJob = [select Id, Account__c, Contact__c, Vehicle__c, Product__r.Product_Group__c, Unit__c from job__c where id = :planning.jobID];
+            
+            ownerAccount = new Account(id = installationJob.Account__c);
+            ownerContact = new Contact(id = installationJob.Contact__c);
+            vehicle      = new Vehicle__c(id = installationJob.Vehicle__c);
+            
+            errorMessage = Label.ODS_EX_Opportunity_Not_Well_Formed;
+            List<OpportunityLineItem> jobOLIList = [SELECT Product2.Id, Product2.ProductCode, Product2.Family, Product2.Job_Type__c, Opportunity.Is_Hold_Stock_Movement__c
+                                                    FROM OpportunityLineItem 
+                                                    WHERE OpportunityId = :opportunity.Id 
+                                                    AND Product2.Family = :bg_Constants.PRODUCT_CATEGORY_JOB
+                                                    AND Product2.Product_Group__c = :installationJob.Product__r.Product_Group__c
+                                                    LIMIT 2];
+            
+            job = new Job__c(Unit__c = installationJob.Unit__c);
+            
+            if (planning.isSwap) {
+                job.Is_Replacement__c = true;
+            }
+            
+            productIDSToSearch = new Set<Id>();
+            
+            for (OpportunityLineItem o : jobOLIList) {
+                
+                if (o.Product2.Job_Type__c == bg_Constants.JOB_TYPE_DEINSTALL) {
+                    productIDSToSearch.add(o.Product2.Id);
+                    deinstallOli = o;
+                } else if (planning.isSwap && o.Product2.Job_Type__c == bg_Constants.JOB_TYPE_INSTALL) {
+                    productIDSToSearch.add(o.Product2.Id);
+                    installOli = o;
+                }
+            }
+            
+            setJobProduct(deinstallOli);
+            
+            setIsSplitPayment();
+            
+            // 1 Create Order
+            errorMessage = Label.ODS_EX_Order_Creation;
+            odsDeistallOrderCreation(planning);
+            
+            // 2 Create Job
+            errorMessage = Label.ODS_EX_Job_Creation;
+            deinstallJobCreation(planning);
+            response.setDeinstallJobId(job.Id);
+            
+            if (planning.isSwap) {
+                job = new Job__c();
+                setJobProduct(installOli);
+                deinstallJobCreation(planning);
+                response.setJobId(job.Id); 
+            }
+            
+            // 3 setup payments
+            errorMessage = Label.ODS_EX_Payment_Creation;
+            setPayment();
+            
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            throw new ODSConstants.ODSException(errorMessage);
+        }
+        
+        return response;
+    }
+    
+    /*
+     * DX-107 20210115 MC
+     * Device deinstall
+     */
+    public void deinstall(ODSRemoveDevice.RemoveDeviceRequest deinstallDeviceRequest, Boolean createCase) {
+        System.debug('ODSPlanner.deinstall');
+        
+        Order_Proposition__c prop;
+        
+        try {
+            errorMessage = Label.ODS_EX_Job_Not_Found;
+            job = [SELECT Id, Order__r.OpportunityId, Order__r.Is_Unit_Rental_fx__c,
+                   Order__r.Opportunity.Invoice_Time__c, Order__r.Opportunity.CurrencyIsoCode, Order__r.Opportunity.Cancel_Subscription_on_Unit_Removal__c,
+                   Order__r.Id, Order__r.Pricebook2Id, Order__r.Is_All_Inclusive__c,
+                   Sales_Source__r.Id, Sales_Source__r.Default_Order_Contact__r.AccountId,
+                   Vehicle__r.id, Order_Product__r.Order_Proposition__r.Expected_Unit_Product__c,
+                   Vehicle__r.Vehicle_Type__c,  Vehicle__r.Make__c, Vehicle__r.Model__c,
+                   Vehicle__r.Colour__c, Vehicle__r.Current_Active_Vehicle_Ownership__c,
+                   Order_Product__r.Order_Proposition__r.Id,
+                   Order_Product__r.Order_Proposition__r.Release_To_Oracle__c,
+                   Order_Product__r.Order_Proposition__r.Product__r.Family,
+                   Contact__r.Id, Installer__c, Revenue_Channel__c, Is_Grouped_Job__c,
+                   Unit__r.Serial_Number__c
+                   FROM Job__c 
+                   WHERE id = :deinstallDeviceRequest.jobID];
+            
+            errorMessage = Label.ODS_EX_Unit_SN_Not_Found;
+            unit = [SELECT Id, Product__r.Id, Order__c, Order_Product__c, Product__r.Family, Unit_Type__c
+                    FROM Unit__c 
+                    WHERE Serial_Number__c = :job.Unit__r.Serial_Number__c
+                    AND Status__c = :bg_Constants.UNIT_STATUS_INSTALLED
+                    ORDER BY CreatedDate DESC
+                    LIMIT 1 ];
+            
+            if (unit == null) {
+                throw new ODSConstants.ODSException(Label.ODS_EX_Unit_SN_Not_Found);
+            }
+            
+            errorMessage = Label.ODS_EX_Engineer_Not_Found;
+            Contact engineer = [select id, Last_Installation__c, Engineer_Code__c from contact where id = :deinstallDeviceRequest.engineerID];
+            
+            prop = job.Order_Product__r.Order_Proposition__r;
+            vehicle = job.Vehicle__r;  
+            order = job.Order__r;
+            reseller = job.Sales_Source__r;
+            ownerContact = job.Contact__r;
+            
+            unit.Status__c = bg_Constants.UNIT_STATUS_REMOVED;   
+            unit.Vehicle__c = null;
+            unit.Unit_Location__c = '';
+            unit.Serial_Number_Validation__c = '';
+            unit.Revenue_Channel__c = job.Revenue_Channel__c;
+            unit.Has_Active_Subscription__c = false; //greacy hack
+            unit.Is_Unit_Rental__c = false;
+            
+            //job.Status__c = bg_Constants.JOB_STATUS_COMPLETE; //DO this Later
+            job.Engineer__c = deinstallDeviceRequest.engineerID;
+            job.Engineer_Code__c = engineer.Engineer_Code__c;
+            
+            if (job.Installer__c == null) {
+                errorMessage = Label.ODS_EX_Installer_Not_Found;
+                job.Installer__c = [select AccountId from Contact where id = :deinstallDeviceRequest.engineerID].AccountId;
+            }
+            
+            job.Site__c = deinstallDeviceRequest.siteID;
+            job.Unit__c = unit.Id;
+            
+            errorMessage = Label.ODS_EX_Invalid_Date_Time;
+            System.debug('checkinstallationDate2 ' + deinstallDeviceRequest.deinstallationDate);
+            if (!String.isEmpty(deinstallDeviceRequest.deinstallationDate)) {
+                Date deinstallationDate = date.valueof(deinstallDeviceRequest.deinstallationDate);
+                System.debug('checkinstallationDate2 ' + deinstallationDate);
+                job.Completed_Date__c = deinstallationDate;
+                unit.Installation_Date__c = deinstallationDate;
+                
+                if (engineer.Last_Installation__c == null || engineer.Last_Installation__c < deinstallationDate) {
+                    engineer.Last_Installation__c = deinstallationDate;
+                }
+                engineer.Engineer_Code__c = engineer.Engineer_Code__c;               
+            }
+            
+            if (!String.isEmpty(deinstallDeviceRequest.completedTime)) {
+                Integer hrs = Integer.valueof(deinstallDeviceRequest.completedTime.SubStringBefore(':'));
+                Integer mm  = Integer.valueOf(deinstallDeviceRequest.completedTime.SubstringAfter(':'));
+                job.Completed_TIme__c = Time.newInstance(hrs, mm, 0, 0);    
+            }
+            
+            update unit;
+            update job;
+            update vehicle;
+            update engineer;
+            
+            errorMessage = Label.ODS_EX_Payment_Creation;
+            if (job.Order__r.Opportunity.Invoice_Time__c == bg_Constants.INVOICE_TIME_ACTIVATION_TIME) {
+                List<Payment__c> payments = new List<Payment__c>();
+                
+                for (Payment__c p : [Select id, Status__c, Is_Instalment__c, Instalment_Header__c, Instalment_Header__r.Status__c
+                                     from Payment__c where Order__c = :job.Order__r.Id]) {
+                                         p.Status__c = bg_Constants.PAYMENT_STATUS_PAID;//bg_Constants.PAYMENT_STATUS_PAYMENT_REQUESTED;
+                                         payments.add(p);
+                                     }
+                
+                prop.Release_To_Oracle__c = bg_Constants.RELEASE_TO_ORACLE_RELEASED;
+                update prop;
+                update payments;
+            }
+            
+            //DX-104 Finishing Touches
+            errorMessage = Label.ODS_EX_Cannot_Complete_Job;
+            job.Status__c = bg_Constants.JOB_STATUS_COMPLETE; // Payment should be Paid
+            update job;
+            
+            try {
+                System.debug('Search subscription(S) if exists ' +Job.Order_Product__r.Order_Proposition__r.Id );
+                List<Subscription__c> subs = [select id, name, Duration_Months__c, Start_Date__c, Unit__r.Status__c 
+                                              from subscription__c 
+                                              where Unit__r.Serial_Number__c = :job.Unit__r.Serial_Number__c
+                                              and Unit__r.Serial_Number__c != ''];
+                
+                List<Subscription__c> subsToUpdate = new List<Subscription__c>();
+                System.debug('subs.size() ' + subs.size());
+                
+                for (Subscription__c sub : subs) {
+                    System.debug('Sub ' + sub.id);
+                    if (job.Order__r.Opportunity.Cancel_Subscription_on_Unit_Removal__c) {
+                        sub.Status__c = bg_Constants.SUB_STATUS_CANCELLED;
+                        subsToUpdate.add(sub);
+                    }                    
+                }
+                
+                update subsToUpdate;
+            } catch(Exception e) {
+                System.debug('Subscription does not exists');
+                System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            }
+            
+            try {
+                System.debug('Search old jobs(S)');
+                List<Job__c> oldJobs = [select id, Is_Unit_Removed__c
+                                        from job__c 
+                                        where Unit__r.Serial_Number__c = :job.Unit__r.Serial_Number__c
+                                        and id != :deinstallDeviceRequest.jobID
+                                        and Job_Type__c = :bg_Constants.JOB_TYPE_INSTALL
+                                        and Is_Unit_Removed__c = false];
+                
+                List<Job__c> oldJobsToUpdate = new List<Job__c>();
+                System.debug('oldJobsToUpdate.size() ' + oldJobsToUpdate.size());
+                
+                for (Job__c j : oldJobs) {
+                    System.debug('j ' + j.id);
+                    j.Is_Unit_Removed__c = true;
+                    oldJobsToUpdate.add(j);
+                }
+                
+                update oldJobsToUpdate;
+            } catch(Exception e) {
+                System.debug('Old jobs do not exists');
+                System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            }               
+            
+        } catch(Exception e) {
+            System.debug('Exception: ' + e.getMessage()+' IN ' + e.getStackTraceString());
+            
+            try {
+                job.Status__c = bg_Constants.JOB_STATUS_PENDING_REQUEST;
+                
+                errorMessage = Label.ODS_EX_Invalid_Date_Time;
+                if (!String.isEmpty(deinstallDeviceRequest.deinstallationDate)) {
+                    Date deinstallationDate = date.valueof(deinstallDeviceRequest.deinstallationDate);
+                    job.Completed_Date__c = deinstallationDate;             
+                }
+                
+                if (!String.isEmpty(deinstallDeviceRequest.completedTime)) {
+                    Integer hrs = Integer.valueof(deinstallDeviceRequest.completedTime.SubStringBefore(':'));
+                    Integer mm  = Integer.valueOf(deinstallDeviceRequest.completedTime.SubstringAfter(':'));
+                    job.Completed_TIme__c = Time.newInstance(hrs, mm, 0, 0);    
+                }
+                
+                errorMessage = Label.ODS_EX_In_Job_Updating;
+                update job;
+            } catch(Exception e1) {
+                System.debug('Exception: ' + e1.getMessage()+' IN ' + e1.getStackTraceString());
+            }
+            
+            try {
+                System.debug('createCase ' + createCase);
+                if (createCase) {
+                    String caseDescription = e.getMessage();
+                    createNoUnitFoundRequest(job.id, job.Sales_Source__r.Id, deinstallDeviceRequest, caseDescription, job.Unit__r.Serial_Number__c);
+                } else {
+                    throw new ODSConstants.ODSException(errorMessage);
+                }
+            }
+            catch(Exception e2) {
+                System.debug('Exception: ' + e2.getMessage()+' ON ' + e2.getLineNumber()+' IN ' + e2.getStackTraceString());
+                throw new ODSConstants.ODSException(errorMessage);
+            }
+        }        
+    }
+    
+    private void setEnabledReseller(String accountID) {
+        reseller = [SELECT Id, Revenue_Channel__c, Is_Blocked__c, RecordType.DeveloperName, Credit_Limit__c, Credit_Remaining__c, Use_Instalment_Aggregation__c
+                    FROM Account
+                    WHERE Id = :accountID];
+        
+        if (reseller.Is_Blocked__c) {
+            throw new ODSConstants.ODSException(Label.ODS_EX_Blocked_Customer);
+        }        
+    }
+    
+    
+    private void setOpportunity(String opportunityID) {
+        opportunity = [
+            SELECT  Id, CurrencyIsoCode, Has_A_Valid_Contract__c, Channel__c, Jobs_Grouping__c, AccountId,
+            Vat_Rate__c, Invoice_Time__c, Is_Unit_Rental__c, Payment_Terms__c, Invoice_Grouping__c,
+            Invoice_Product_Group__c, Invoice_Split__c, Invoice_Instalments_Split__c,
+            Revenue_Channel__c, Payment_Type__c, Receipt_Method__c, Split_Payment__c, 
+            pricebook2id, pricebook2.Product_Price_Book__c, Is_Items_Order__c, Subsidiary_fx__c, Is_Hold_Stock_Movement__c,
+            Is_Job_Performed_by_Customer__c, Is_Free_Subscription__c, Is_Free_Unit__c,Change_VO_Mode__c,
+            Triangulation__c, BU_Grouping_Enabled__c,Renewal_Cancellation_Requested__c
+            FROM    Opportunity 
+            WHERE   Id = :opportunityID
+            AND     (StageName  = :bg_Constants.OPPORTUNITY_STAGE_CLOSED_ACTIVE or StageName = :bg_Constants.OPPORTUNITY_STAGE_CLOSED_WON)
+            AND     Subsidiary_fx__c = :bg_Constants.USER_SUBSIDIARY_LJIT ];
+        //, Prevent_Sub_Activation_On_Job_Complete__c
+    }    
+    
+    /*
+     * Requires the following Opportunity's fields:
+     *  - Payment_Type__c
+     *  - Split_Payment__c
+     */
+    private void setIsSplitPayment() {
+        if (!String.isEmpty(opportunity.Payment_Type__c) && opportunity.Payment_Type__c == bg_Constants.OPPORTUNITY_PAYEMENT_TYPE_SPLIT_PAYMENT)
+        {
+            isSplitPayment = true;
+        } else {
+            isSplitPayment = false;
+        }
+        if(opportunity.Split_Payment__c != null && !String.isEmpty(opportunity.Split_Payment__c)){
+            splitPayment = opportunity.Split_Payment__c;
+            isSplitPayment = true;
+        }
+    }
+    
+    /*
+     * 20210324 MC
+     * Truncate a string according with the size of the
+     * field passed as parameter
+     */
+    private String truncateString(String s, Schema.DescribeFieldResult F) {
+        Integer lengthOfField = F.getLength();            
+        
+        if (!String.isEmpty(s)) {
+            if(s.length() > lengthOfField) {
+                return s.substring(0, lengthOfField);
+            } else {
+                return s;
+            }
+        } else {
+            return '';
+        }
+    }
+        
+    /*
+     * 20210727 
+     * Set Subscriptions vechile to stolen
+     * vehicle request passed as parameter
+     */
+    public void setsubscriptionToVehicleStolen(ODSsubscriptionToVehicleStolen.VehicleStolenRequest vehicleStolen) {
+        System.debug('setsubscriptionToVehicleStolen: ' + vehicleStolen.vin);
+
+        try{
+            List<Subscription__c> subsList = [SELECT Id, Status__c, PreviousSubscriptionStatus__c, End_Date__c
+                                              FROM Subscription__c
+                                              WHERE vehicle_ownership__r.vehicle__r.vin__c in (:vehicleStolen.vin)];
+            
+            for (Subscription__c s : subsList) {
+                if(vehicleStolen.Stolen == true) {
+                    s.PreviousSubscriptionStatus__c= s.Status__c;
+                    s.Status__c = bg_Constants.SUBSCRIPTION_STATUS_VEHICLE_STOLEN;
+                } else if(s.End_Date__c <= date.today()) { //vehicleStolen.Stolen==false 
+                    s.Status__c=bg_Constants.SUBSCRIPTION_STATUS_LAPSED;
+                } else {
+                    s.Status__c= s.PreviousSubscriptionStatus__c;
+                }
+            }
+
+            if (!subsList.isEmpty()) {
+                System.debug('subsList to update: ' + subsList.size());
+                update subsList; 
+            }else{
+                throw new ODSConstants.ODSException(bg_Constants.ODS_NO_VO_FOR_VIN); //need to create a custom label for error message   
+            }           
+            
+        } catch(exception e){
+            throw new ODSConstants.ODSException(e.getMessage());
+        }
+    }
+    
+    /*
+     * 20210727 
+     * Set case status to closed
+     * case request passed as parameter
+     */
+    public void setrecallCase(ODSrecallCase.recallCaseRequest recallCase) {
+        List<Case> caseList = [SELECT Id, Status
+                               FROM Case
+                               WHERE casenumber = :recallCase.caseNumber limit 1];
+        
+        if(caseList.Size() > 0){
+            caseList[0].Status = bg_Constants.CASE_STATUS_CLOSED;
+            Update caseList;
+        }else if (caseList.Size() == 0) {
+            throw new ODSConstants.ODSException(Label.ODS_EX_Blocked_Customer); //need to create a custom label for error message
+        }
+    }
+    
+    /*
+     * 20210830 DX-148
+     * Create Unit exchange
+     * Author : Radha V
+     */
+    public ODSUnitExchange.UnitExchangeResponse createUnitExchange(ODSUnitExchange.UnitExchangeRequest unitExchangeRequest){
+        ODSUnitExchange.UnitExchangeResponse response = new ODSUnitExchange.UnitExchangeResponse();
+        
+        setEnabledReseller(unitExchangeRequest.salesSourceID);
+        setOpportunity(unitExchangeRequest.subscriptionOpportunityId);
+        originOpportunity = opportunity.clone();
+        
+        if (contractCheckNeeded()) {
+            if (!opportunity.Has_A_Valid_Contract__c) {
+                throw new ODSConstants.ODSException(Label.ODS_EX_Invalid_Contract);
+            }
+        }
+        
+        //Transform the request in order to use current Mehtod
+        ODSCreatePlanning.CreatePlanningRequest p = unitExchangeRequest.toCreatePlanningRequest();
+        
+        ownerCreateOrRetrieve(p);
+        vehicleCreateOrRetrieve(p);
+        
+        Case c = unitExchangeCaseCreation(unitExchangeRequest);
+        
+        response.setCase(c);
+        return response;
+    }  
+    
+    /*
+     * 20210910 DX-148
+     *  Unit Exchange case creation
+     */    
+    private Case unitExchangeCaseCreation(ODSUnitExchange.UnitExchangeRequest unitExchangeRequest){
+        System.debug('unitExchangeCaseCreation');
+        Integer additionalYears = 0;
+        if (!String.isEmpty(unitExchangeRequest.additionalYears)) {
+            additionalYears = Integer.valueOf(unitExchangeRequest.additionalYears);
+        }
+        
+        //Transform the request in order to use current Mehtod
+        ODSCreatePlanning.CreatePlanningRequest p = unitExchangeRequest.toCreatePlanningRequest();
+        
+        ownerCreateOrRetrieve(p);
+        vehicleCreateOrRetrieve(p);        
+        
+        Case unitCase = getODSCase(bg_Constants.CASE_TYPE_UNIT_EXCHANGE); 
+        unitCase.subject = bg_Constants.CASE_TYPE_UNIT_EXCHANGE;
+        unitCase.ContactId = ownerContact.id;
+        unitCase.AccountId = ownerAccount.id;
+        unitCase.Sales_Source__c = unitExchangeRequest.salesSourceID;
+        unitCase.opportunity__c = unitExchangeRequest.subscriptionOpportunityId;
+        unitCase.SuppliedPhone = unitExchangeRequest.ewPhone;
+        
+        if (unitExchangeRequest.jobPreferredDate != null && !String.isEmpty(unitExchangeRequest.jobPreferredDate)) {
+            unitCase.Job_Preferred_Date__c = date.valueOf(unitExchangeRequest.jobPreferredDate);
+        }
+        
+        if (unitExchangeRequest.jobScheduledDate != null && !String.isEmpty(unitExchangeRequest.jobScheduledDate)) {        
+            unitCase.Job_Completed_Date__c = date.valueOf(unitExchangeRequest.jobScheduledDate);
+        }
+        
+        if(!String.isEmpty(unitExchangeRequest.jobPreferredTime)){
+            Integer hrs = Integer.valueof(unitExchangeRequest.jobPreferredTime.SubStringBefore(':'));
+            Integer mm  = Integer.valueOf(unitExchangeRequest.jobPreferredTime.SubstringAfter(':'));
+            unitCase.Job_Preferred_Time__c = Time.newInstance(hrs, mm, 0, 0); 
+        }
+        
+        if(!String.isEmpty(unitExchangeRequest.jobScheduledTime)){
+            Integer hrs = Integer.valueof(unitExchangeRequest.jobScheduledTime.SubStringBefore(':'));
+            Integer mm  = Integer.valueOf(unitExchangeRequest.jobScheduledTime.SubstringAfter(':'));
+            unitCase.Job_Completed_Time__c = Time.newInstance(hrs, mm, 0, 0); 
+        }
+        
+        unitCase.is_job_engineer_requested__c = unitExchangeRequest.engineerRequest;
+        unitCase.vehicle__c = vehicle.id;
+        unitCase.vehicle_ownership__c = [select id from vehicle_ownership__c 
+                                         where vehicle__r.vin__c = :unitExchangeRequest.oldVehicleVin 
+                                         and Is_Current_Ownership__c = true].id;
+        
+        //unitCase.Subscription_Product__c = [select id from product2 where productcode = :unitExchangeRequest.subscriptionCode limit 1].id;
+        unitCase.Additional_Years__c = additionalYears;
+        insert unitCase;
+        
+        return unitCase;
+    }   
+    
+    /*
+     * 20210910 DX-148
+     *  Unit Exchange case resolution
+     */
+    public void completeUnitExchangeCase(Case c){
+        System.debug('completeUnitExchangeCase');
+        
+        String caseSuggestedSolution = '';
+        Integer additionalMonths  = 0;
+        
+        try {
+            c.Suggested_Solution__c = caseSuggestedSolution;
+            c.Technical_Description__c = caseSuggestedSolution;
+            
+            if (c.ownerid != UserInfo.getUserId()) {
+                caseSuggestedSolution = bg_Constants.CASE_SUGGESTED_SOLUTION_TAKE_OWNERSHIP;
+                throw new ODSConstants.ODSException(caseSuggestedSolution);
+            }
+            
+            setEnabledReseller(c.sales_source__c);
+            setOpportunity(c.opportunity__c);
+            originOpportunity = opportunity.clone();
+            
+            if (contractCheckNeeded()) {
+                if (!opportunity.Has_A_Valid_Contract__c) {
+                    throw new ODSConstants.ODSException(Label.ODS_EX_Invalid_Contract);
+                }
+            }
+            
+            pricebookID = opportunity.pricebook2id;
+            
+            caseSuggestedSolution = bg_Constants.CASE_SUGGESTED_SOLUTION_ADD_JOB_TO_OPT;
+            OpportunityLineItem jobOLI = [SELECT Product2.Id, Product2.ProductCode, Product2.Family 
+                                            FROM OpportunityLineItem 
+                                            WHERE OpportunityId = :opportunity.Id 
+                                            AND Product2.Family = :bg_Constants.PRODUCT_CATEGORY_JOB 
+                                            AND Product2.Job_Type__c = :bg_Constants.JOB_TYPE_INSTALL LIMIT 1];
+            
+            caseSuggestedSolution = bg_Constants.CASE_SUGGESTED_SOLUTION_ADD_SUB_TO_OPT;
+            OpportunityLineItem subOLI = [SELECT Product2.Id, Product2.ProductCode, Product2.Variable_Period_In_Months__c, Product2.Period_In_Months__c, 
+                                            Opportunity.Accountid, Product2.Family, ListPrice, UnitPrice 
+                                            FROM OpportunityLineItem 
+                                            WHERE Product2.Family in (:bg_Constants.PRODUCT_CATEGORY_SUBSCRIPTION, :bg_Constants.PRODUCT_CATEGORY_PROPOSITION) 
+                                            AND Product2.Id = :c.Subscription_Product__c LIMIT 1];                                        
+            caseSuggestedSolution = '';
+            
+            setJobProduct(jobOLI);
+            setSubscriptionProduct(subOLI);
+            
+            productIDSToSearch = new Set<Id>();
+            productIDSToSearch.add(jobOLI.Product2.Id);
+            productIDSToSearch.add(subOLI.Product2.Id);   
+            
+            setIsSplitPayment();
+            
+            ODSUnitExchange.unitExchangeRequest unitExchangeRequest = new ODSUnitExchange.unitExchangeRequest();
+            ODSCreatePlanning.CreatePlanningRequest p = unitExchangeRequest.toCreatePlanningRequest(c);
+            
+            if(c.Additional_Years__c != null && c.Additional_Years__c > 0) {
+                unitExchangeWithoutAdditionalYears = false;
+                additionalMonths = Integer.valueOf(c.Additional_Years__c*12);
+            } else {
+                unitExchangeWithoutAdditionalYears = true;
+            }
+            System.debug('c.Additional_Years__c ' + c.Additional_Years__c);
+            System.debug('unitExchangeWithoutAdditionalYears ' + unitExchangeWithoutAdditionalYears);
+            
+            ownerCreateOrRetrieve(p);
+            
+            vehicleCreateOrRetrieve(p);
+            
+            odsOrderCreation(p);
+            order.Origin__c = bg_Constants.ORDER_ORIGIN_RENEWAL_MASS_UPLOAD;
+            decimal renewalCount = 1;
+            if(order.Renewal_Count__c != null){
+               renewalCount = order.Renewal_Count__c + 1;
+            }
+            order.Renewal_Count__c = renewalCount;
+            update order;
+            
+            jobCreation(p);
+            
+            subscriptionCreation(p);
+            
+            c.job__c = job.id;
+            c.order__c = order.id;
+            
+            // Renew the subscription
+            caseSuggestedSolution = bg_Constants.CASE_SUGGESTED_SOLUTION_SELECT_A_SUBSCRIPTION;
+            Subscription__c oldSubscription = [select id, Start_Date__c, End_Date__c, Status__c, renewed_to_subscription__c from Subscription__c where id in (:c.subscription__c) limit 1];
+            oldSubscription.Renewed_To_Subscription__c = subscription.id;
+            oldSubscription.status__c = bg_Constants.SUBSCRIPTION_STATUS_RENEWED;
+            caseSuggestedSolution = '';
+            
+            subscription.Vehicle_Ownership__c = vehicleOwnership.id;
+            subscription.Renewal_Method__c = bg_Constants.SUBSCRIPTION_RENEWAL_METHOD_UNIT_EXCHANGE;
+            subscription.Renewed_From_Subscription__c = oldSubscription.id;
+            subscription.Start_Date__c = oldSubscription.Start_Date__c;
+            subscription.End_Date__c = oldSubscription.End_Date__c;
+            
+            if (oldSubscription.End_Date__c == null) {
+                caseSuggestedSolution = bg_Constants.CASE_SUGGESTED_SOLUTION_INVALID_SUBSCRIPTION_END_DATE;
+                throw new ODSConstants.ODSException(caseSuggestedSolution);
+            }
+            
+            if (unitExchangeWithoutAdditionalYears) {
+                subscription.Is_Free_Subscription__c = true;
+            } else if(c.Additional_Years__c > 0 ){               
+                System.debug('additionalMonths ' + additionalMonths);
+                System.debug('subscription.Duration_Months__c ' + subscription.Duration_Months__c); 
+                subscription.Is_Free_Subscription__c = false;
+                subscription.End_Date__c = oldSubscription.End_Date__c.addMonths(additionalMonths);
+                subscription.Duration_Months__c = subOLI.Product2.Period_In_Months__c;// + additionalMonths;
+                System.debug('subscription.Duration_Months__c ' + subscription.Duration_Months__c);
+            }
+            
+            List<Subscription__c> subList = new List<Subscription__c>();
+            subList.add(subscription);
+            subList.add(oldSubscription);
+            update subList;
+            
+            Vehicle_Ownership__c oldVO = [select id, Vehicle__c from Vehicle_Ownership__c where id in (:c.vehicle_ownership__c) limit 1];
+            Vehicle__c oldVehicle = new Vehicle__c(id = oldVO.Vehicle__c);
+            oldVO.End_Date__c = System.today();
+            update oldVO;
+            
+            oldVehicle.Current_Active_Vehicle_Ownership__c = null;
+            update oldVehicle;
+            
+        } catch(Exception e) {
+            c.Suggested_Solution__c = caseSuggestedSolution;
+            throw new ODSConstants.ODSException(e.getMessage());
+        }   
+    }
+    
+    /*
+     * 20210908
+     * Create Change Vehicle Ownership
+     * Author : Radha V
+     */
+    public ODSChangeVO.ChangeVOResponse createChangeOwnership(ODSChangeVO.ChangeVORequest changeVORequest){
+        ODSChangeVO.ChangeVOResponse response = new ODSChangeVO.ChangeVOResponse();
+        
+        setEnabledReseller(changeVORequest.salesSourceID);
+        setOpportunity(changeVORequest.subscriptionOpportunityId);
+        originOpportunity = opportunity.clone();
+        
+        if (contractCheckNeeded()) {
+            if (!opportunity.Has_A_Valid_Contract__c) {
+                throw new ODSConstants.ODSException(Label.ODS_EX_Invalid_Contract);
+            }
+        }
+        pricebookID = opportunity.pricebook2id;
+        setIsSplitPayment();
+        
+        ODSCreatePlanning.CreatePlanningRequest pr = changeVORequest.toCreatePlanningRequest();
+        ownerCreateOrRetrieve(pr);
+        vehicle = [select id, Current_Active_Vehicle_Ownership__c from Vehicle__c where Vin__c = :changeVORequest.vehicleVin];
+        
+        Case c = changeVOCaseCreation(changeVORequest);
+        response.setCase(c);
+        
+        return response;
+    }
+
+    /*
+     * 20210910 DX-148
+     *  VO Exchange case creation
+     */        
+    private Case changeVOCaseCreation(ODSChangeVO.ChangeVORequest changeVORequest){
+        System.debug('changeVOCaseCreation');
+        Integer additionalYears = 0;
+        if (!String.isEmpty(ChangeVORequest.additionalYears)) {
+            additionalYears = Integer.valueOf(ChangeVORequest.additionalYears);
+        }
+        
+        Case changeOwnercase = getODSCase(bg_Constants.CASE_TYPE_CHANGE_VEHICLE_Ownership); 
+        changeOwnercase.subject = bg_Constants.CASE_TYPE_CHANGE_VEHICLE_Ownership;
+        changeOwnercase.ContactId = ownerContact.id;
+        changeOwnercase.AccountId = ownerAccount.id;
+        changeOwnercase.Sales_Source__c = changeVORequest.salesSourceID;
+        changeOwnercase.opportunity__c = changeVORequest.subscriptionOpportunityId;
+        changeOwnercase.Vehicle__c = vehicle.Id;
+        changeOwnercase.vehicle_ownership__c = vehicle.Current_Active_Vehicle_Ownership__c; 
+        changeOwnercase.Additional_Years__c = additionalYears;
+        changeOwnercase.SuppliedPhone = changeVORequest.ewPhone;
+        insert changeOwnercase;
+        return changeOwnercase;
+    }  
+    
+    /*
+     * 20210910 DX-148
+     *  VO Exchange case resolution
+     */    
+    public void completeVOCaseResolution(Case c){ 
+        System.debug('completeVOCaseResolution');
+        String caseSuggestedSolution = '';
+        try{
+            c.Suggested_Solution__c = caseSuggestedSolution;
+            c.Technical_Description__c = caseSuggestedSolution;
+            
+            if (c.ownerid != UserInfo.getUserId()) {
+                caseSuggestedSolution = bg_Constants.CASE_SUGGESTED_SOLUTION_TAKE_OWNERSHIP;
+                throw new ODSConstants.ODSException(caseSuggestedSolution);
+            }
+            setEnabledReseller(c.sales_source__c);
+            setOpportunity(c.opportunity__c);
+            originOpportunity = opportunity.clone();
+
+            if (contractCheckNeeded()) {
+                if (!opportunity.Has_A_Valid_Contract__c) {
+                    throw new ODSConstants.ODSException(Label.ODS_EX_Invalid_Contract);
+                }
+            }
+
+            pricebookID = opportunity.pricebook2id;
+
+            caseSuggestedSolution = bg_Constants.CASE_SUGGESTED_SOLUTION_ADD_SUB_TO_OPT;
+            OpportunityLineItem subOLI = [SELECT Product2.Id, Product2.ProductCode, Product2.Variable_Period_In_Months__c, Product2.Period_In_Months__c, 
+                                          Opportunity.Accountid, Product2.Family, ListPrice, UnitPrice 
+                                          FROM OpportunityLineItem 
+                                          WHERE Product2.Family in (:bg_Constants.PRODUCT_CATEGORY_SUBSCRIPTION, :bg_Constants.PRODUCT_CATEGORY_PROPOSITION) 
+                                          AND Product2.Id = :c.Subscription_Product__c LIMIT 1];                                        
+            caseSuggestedSolution = '';
+            
+            setSubscriptionProduct(subOLI);
+            
+            productIDSToSearch = new Set<Id>();
+            productIDSToSearch.add(subOLI.Product2.Id); 
+
+            setIsSplitPayment();
+            
+            ODSChangeVO.ChangeVORequest changeVORequest = new ODSChangeVO.ChangeVORequest ();
+            ODSCreatePlanning.CreatePlanningRequest planVo = ChangeVORequest.toCreatePlanningRequest(c);
+           
+            //Calling ChangeVOOrderSetUp Method
+            changeVOOrderSetUp(c);
+            /*
+            //Updating Subscription
+            List<Subscription__c> subList = new List<Subscription__c>();
+            subList.add(subscription);
+            update subList;
+            */
+        }
+        catch(Exception e) {
+            c.Suggested_Solution__c = caseSuggestedSolution;
+            throw new ODSConstants.ODSException(e.getMessage());
+        }
+    }
+
+    /*
+     * 20210915 DX-148-C
+     *  VO Exchange Order Fix
+     */
+    public void changeVOOrderSetUp(Case c1){
+        System.debug('changeVOOrderSetUp');
+        String caseSuggestedSolution = '';
+
+        try{
+            c1.Suggested_Solution__c = caseSuggestedSolution;
+            c1.Technical_Description__c = caseSuggestedSolution;
+
+            ODSChangeVO.ChangeVORequest changeVORequest = new ODSChangeVO.ChangeVORequest ();
+            ODSCreatePlanning.CreatePlanningRequest planVo = ChangeVORequest.toCreatePlanningRequest(c1);
+
+            if(opportunity.Change_VO_Mode__c == bg_Constants.OPPORTUNITY_CHANGE_VO_MODE_WITH_OUT_ADDITIONAL_YEARS) {
+                changeVOWithoutAdditionalYears = true;
+            }
+
+            ownerCreateOrRetrieve(planVo);
+            vehicleCreateOrRetrieve(planVo);
+
+            odsOrderCreation(planVo);
+
+            subscriptionCreation(planVo);
+            caseSuggestedSolution = bg_Constants.CASE_SUGGESTED_SOLUTION_SELECT_A_SUBSCRIPTION;
+            Subscription__c oldSubscription = [select id, Start_Date__c, End_Date__c,Renewal_Method__c, Status__c, renewed_to_subscription__c from Subscription__c where id in (:c1.subscription__c) limit 1];
+            oldSubscription.Renewed_To_Subscription__c = subscription.id;
+            caseSuggestedSolution = '';
+
+            subscription.Vehicle_Ownership__c = c1.vehicle_ownership__c;
+            subscription.Renewed_From_Subscription__c =oldSubscription.id;
+            Product2 voProduct = [select id,Name,Period_In_Months__c from Product2 where id in (:c1.Subscription_Product__c) limit 1];
+            subscription.Duration_Months__c = voProduct.Period_In_Months__c;
+            subscription.Renewal_Method__c = bg_Constants.SUBSCRIPTION_RENEWAL_METHOD_CHANGE_VEHICLE_OWNERSHIP;
+
+            if (oldSubscription.End_Date__c == null) {
+                caseSuggestedSolution = bg_Constants.CASE_SUGGESTED_SOLUTION_INVALID_SUBSCRIPTION_END_DATE;
+                throw new ODSConstants.ODSException(caseSuggestedSolution);
+            }
+
+            if(oldSubscription.Start_Date__c != null){
+                subscription.Start_Date__c = oldSubscription.Start_Date__c;
+            }
+
+            if(oldSubscription.End_Date__c != null){
+                subscription.End_Date__c = oldSubscription.End_Date__c;
+            }
+
+            if (oldSubscription.Status__c <> bg_Constants.SUBSCRIPTION_STATUS_LAPSED) {
+                decimal renewalCount = 1;
+                if(order.Renewal_Count__c != null){
+                    renewalCount = order.Renewal_Count__c + 1;
+                }
+                order.Renewal_Count__c = renewalCount;
+                update order;
+            }
+            oldSubscription.status__c = bg_Constants.SUBSCRIPTION_STATUS_RENEWED;            
+           
+            if (changeVOWithoutAdditionalYears) {
+                subscription.Is_Free_Subscription__c = true;
+            } else {
+                Integer months = Integer.valueOf(subscription.Duration_Months__c);
+                subscription.Is_Free_Subscription__c = false;
+
+                if(c1.Subscription_Renewal_Period__c == bg_Constants.CASE_RESTART_SUBSCRIPTION){
+                    subscription.Start_Date__c = c1.createdDate.date();
+                    subscription.End_Date__c = c1.CreatedDate.date().addMonths(months)-1;
+                    order.Origin__c = bg_Constants.ORDER_ORIGIN_RENEWAL_MASS_UPLOAD;
+                } else if(c1.Subscription_Renewal_Period__c == bg_Constants.CASE_PREVIOUS_SUBSCRIPTION){
+                    subscription.End_Date__c = oldSubscription.End_Date__c.addMonths(months);
+                }
+                //Create Payment
+                setPayment();
+            }
+            
+            c1.Order__c = order.Id;
+            List<Subscription__c> subList = new List<Subscription__c>();
+            subList.add(subscription);
+            subList.add(oldSubscription);
+            update subList;
+        }
+        catch(Exception e){
+            c1.Suggested_Solution__c = caseSuggestedSolution;
+            throw new ODSConstants.ODSException(e.getMessage());
+        }
+     }
+
+}

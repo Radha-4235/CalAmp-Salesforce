@@ -1,0 +1,233 @@
+/**
+* @Name SubscriptionRenewalBatch
+* @Description Batch class to auto renewal subscriptions
+* @Author 
+* @Version 1.0
+* 
+* Date          Author                  Change Description
+* -------------------------------------------------------------------------------------------------------------
+* 
+*/
+global class SubscriptionOPRenewalBatch implements Database.Batchable<SObject> {
+    
+    global Database.QueryLocator start(Database.BatchableContext context) {        
+        return Database.getQueryLocator([Select Id, Sub_Name__c,Invoice_Grouping__c,Invoice_Time__c,
+                                         Payment_Terms__c,Payment_Type__c,Pricebook_Id__c,ProductCode__c,
+                                         Receipt_Method__c,SalesPrice__c,Status__c,Type__c,Vat_Rate_Id__c from 
+                                         SubscriptionOP__c where Status__c != 'Completed']);
+    }
+    
+    
+    global void execute(Database.BatchableContext context, List<SubscriptionOP__c> subOpList) {
+        try{
+            if(subOpList.Size() > 0){
+                String currencyIsoCode = 'EUR';
+                Map<String, SubscriptionOP__c> subNameToSubOpRecMap = new Map<String, SubscriptionOP__c>();
+                Set<String> prodCode = new Set<String>();
+                Map<String, String> subNameToProductIdMap = new Map<String, String>();
+                Map<String, Product2> subNameToProdMap = new Map<String, Product2>();
+                Map<String, Set<String>> subNametoMulProdMap = new Map<String, Set<String>>();
+                Map<String, SubscriptionOP__c> prodCodeTosubOpMap= new Map<String, SubscriptionOP__c>();
+                
+                for(SubscriptionOP__c subOP : subOpList){
+                    //subNames.add(subOP.Sub_Name__c);
+                    prodCodeTosubOpMap.put(subOP.ProductCode__c, subOP);
+                    subNameToSubOpRecMap.put(subOP.Sub_Name__c, subOp);
+                    subNameToProductIdMap.put(subOP.Sub_Name__c, subOP.ProductCode__c);
+                    if(subNametoMulProdMap.containsKey(subOP.Sub_Name__c)){
+                        Set<String> prodCodes = subNametoMulProdMap.get(subOP.Sub_Name__c);
+                        prodCodes.add(subOP.Type__c+'-'+subOp.ProductCode__c);
+                        subNametoMulProdMap.put(subOP.Sub_Name__c, prodCodes);
+                    }else{
+                        subNametoMulProdMap.put(subOP.Sub_Name__c, new Set<String>{subOP.Type__c+'-'+subOp.ProductCode__c});
+                    }
+                }
+                Map<Id, Subscription__c> subMap = new Map<Id, Subscription__c>([Select Id, Name, Renewed_From_Subscription__c, 
+                                                                                Renewed_To_Subscription__c, Account__r.default_order_contact__c, 
+                                                                                Account__c, Account__r.RecordType.DeveloperName, Account__r.Type, 
+                                                                                account__r.ownerid,End_Date__c,Start_Date__c, Vehicle_Ownership__r.Vehicle__c, 
+                                                                                Revenue_Channel__c,Sales_Source__c,Unit__c,Vehicle_Ownership__c,Is_Renewal__c,Renewal_Method__c
+                                                                                from Subscription__c 
+                                                                                where Name IN:subNameToSubOpRecMap.KeySet()]);
+                 Map<String, Product2> productMap = new Map<String, Product2>();
+                for(Product2 prodRec : [Select Id, ProductCode, Period_In_Months__c 
+                                        from Product2 
+                                        where ProductCode =: prodCodeTosubOpMap.KeySet()]){
+                       productMap.put(prodRec.ProductCode, prodRec);                                                   
+                  
+                }
+               
+               
+                system.debug('productMapkeys'+productMap.KeySet());
+                system.debug('productMap'+productMap);
+                                
+                for(SubscriptionOP__c subOPRec : subOpList){
+                    system.debug('ProdName'+ productMap.get(subNameToProductIdMap.get(subOPRec.Sub_Name__c)));
+                    system.debug('Subname'+ subNameToProductIdMap.get(subOPRec.Sub_Name__c));
+                    subNameToProdMap.put(subOPRec.Sub_Name__c, productMap.get(subNameToProductIdMap.get(subOPRec.Sub_Name__c)));
+                }
+                
+                for(Subscription__c subRec : subMap.Values()){
+                    Order order = bg_OrderUtils.CreateOrder(subRec.Account__c,
+                                                            currencyIsoCode, bg_Constants.ORDER_STATUS_DRAFT,
+                                                            subRec.Account__r.default_order_contact__c, date.today());
+                    order.Pricebook2Id = subNameToSubOpRecMap.get(subRec.Name).Pricebook_Id__c;
+                    order.Sales_Source__c = subRec.Account__c;
+                    order.ownerid = subRec.account__r.ownerid;
+                    
+                    // Italy fields
+                    order.Vat_Rate__c = subNameToSubOpRecMap.get(subRec.Name).Vat_Rate_Id__c;
+                    order.Invoice_Time__c = subNameToSubOpRecMap.get(subRec.Name).Invoice_Time__c;
+                    order.Payment_Terms__c = subNameToSubOpRecMap.get(subRec.Name).Payment_Terms__c;
+                    order.Invoice_Grouping__c = subNameToSubOpRecMap.get(subRec.Name).Invoice_Grouping__c;
+                    order.Revenue_Channel__c = subRec.Revenue_Channel__c;
+                    order.Payment_Type__c = 'Single Payment';
+                    order.Is_Triangulation__c = false;
+                    
+                    //DX-109
+                    if(subRec.Account__r.Type != null && subRec.Account__r.Type == bg_Constants.ACCOUNT_TYPE_RETAIL){
+                        order.Type = bg_Constants.ORDER_TYPE_RETAIL;
+                    } else {
+                        order.Type = bg_Constants.ORDER_TYPE_CORPORATE; // Set Default
+                    }
+                    if(order.Payment_Type__c == null){
+                        order.Payment_Type__c = bg_Constants.ORDER_PAYMENT_TYPE_SINGLE; // Set Default
+                    }
+                    
+                    // Can Check Opp.New_Order_Type__c
+                    if (subRec.Account__r.RecordType.DeveloperName == bg_Constants.RECORDTYPE_ACCOUNT_CORPORATE_CUSTOMER) {
+                        order.Type = bg_Constants.ORDER_TYPE_CORPORATE;
+                    } else if (subRec.Account__r.RecordType.DeveloperName == bg_Constants.RECORDTYPE_ACCOUNT_DEALER_CUSTOMER) {
+                        order.Type = bg_Constants.ORDER_TYPE_DEALER_SALE;
+                    } else if (subRec.Account__r.RecordType.DeveloperName == bg_Constants.RECORDTYPE_ACCOUNT_RETAIL_CUSTOMER) {
+                        order.Type = bg_Constants.ORDER_TYPE_RETAIL;
+                    }
+                    Insert order;
+                    
+                    
+
+                    String ProductCode = subNameToSubOpRecMap.get(subRec.Name).ProductCode__c;
+                    System.debug('ProductCode'+ProductCode);
+                    Id PriceBookEntryId = Id.ValueOf(subNameToSubOpRecMap.get(subRec.Name).Pricebook_Id__c); 
+
+                    Pricebookentry pbe = [select id,UnitPrice from pricebookentry where productcode =: ProductCode and Pricebook2Id =: PriceBookEntryId limit 1];
+					
+                    Order_Proposition__c prop = bg_OrderUtils.CreateOrderProposition(order.Id, null, null, null, currencyIsoCode);
+                    prop.Vehicle__c = subRec.Vehicle_Ownership__r.Vehicle__c;
+                    prop.Sales_Price__c = subNameToSubOpRecMap.get(subRec.Name).SalesPrice__c; 
+                    prop.List_Price__c = pbe.UnitPrice;
+                    Insert Prop;
+                    
+                    system.debug('PriceBookEntryId' + PriceBookEntryId);
+                    OrderItem newOrderItem = bg_OrderUtils.CreateOrderItem(order.Id, pbe.Id, Prop.Id, 1, Prop.Sales_Price__c);
+                    
+                    Insert newOrderItem;
+                    decimal amount=0;
+                    
+                    Subscription__c Subscription;
+                    Additional_Service__c addService;
+                    for(String subtype : subNametoMulProdMap.get(subRec.Name)){
+                        System.debug('subtype'+subtype);
+                        String stype = subtype.substringBefore('-');
+                        System.debug('stype '+stype );
+                        String subProdCode = subtype.substringAfter('-');
+                        System.debug('subProdCode '+subProdCode );
+                        if(stype == 'SUB'){
+                            Subscription = new Subscription__c();
+                            
+                            Subscription.Account__c = subRec.Account__c;
+                            Subscription.Contact__c = subRec.Account__r.default_order_contact__c;
+                            Subscription.Order__c = order.Id;
+                            Subscription.Status__c = bg_Constants.SUBSCRIPTION_STATUS_ACTIVE;
+                            subscription.Owner__c = subRec.Account__r.OwnerId;
+                            subscription.Product__c = productMap.get(subProdCode).Id;
+                            subscription.Order_Product__c=newOrderItem.id;
+                            Subscription.Is_Renewal__c=true;
+                            Subscription.Renewal_Method__c = 'Manual';
+                            subscription.Duration_Months__c= productMap.get(subProdCode).Period_In_Months__c;
+                            Subscription.Start_Date__c = subRec.End_Date__c + 1;
+                            system.debug('Start Date'+subNameToProdMap.get(subRec.name).Period_In_Months__c);
+                            Subscription.End_Date__c = subRec.Start_Date__c.addMonths(Integer.valueOf(subNameToProdMap.get(subRec.name).Period_In_Months__c)) - 1;
+                            Subscription.renewed_from_subscription__C  = subrec.Id;
+                            Subscription.Sales_Source__c = subRec.Sales_Source__c;
+                            Subscription.Unit__c=subRec.Unit__c;
+                            Subscription.Vehicle_Ownership__c=subRec.Vehicle_Ownership__c;
+                            
+                            Insert Subscription;
+                            system.debug('SubScription Id is:'+Subscription.id);
+                            if(addService != null)
+                                addService.Subscription__c = Subscription.Id;
+                            Update addService;
+                            amount=amount+pbe.UnitPrice;
+                            system.debug('Amount is :'+amount);
+                            subRec.Status__c = bg_Constants.SUBSCRIPTION_STATUS_RENEWED;
+                            subRec.Renewed_To_Subscription__c = Subscription.Id;
+                            
+                            Update subRec;
+                        }
+						//system.debug(Subscription.id);
+						if(stype == 'AS'){
+                            addService = new Additional_Service__c();
+                            addService.Order__c = order.Id;
+                            addService.Product__c =  productMap.get(subProdCode).Id;
+                            addService.Order_Product__c=newOrderItem.id;
+                            addService.Status__c = bg_Constants.SUBSCRIPTION_STATUS_ACTIVE;
+                            addService.Start_Date__c = subRec.End_Date__c + 1;
+                            //system.debug('Start Date'+subNameToProdMap.get(subRec.name).Period_In_Months__c);
+                            addService.End_Date__c = subRec.Start_Date__c.addMonths(Integer.valueOf(subNameToProdMap.get(subRec.name).Period_In_Months__c)) - 1;
+                            if(Subscription != null)
+                            addService.Subscription__c = Subscription.Id;
+                            
+                            Insert addService;
+                            system.debug('Additional Service Inserted: '+addService.id);
+                            amount=amount+pbe.UnitPrice;
+                            //system.debug('Amount is :'+amount);
+                            subRec.Status__c = bg_Constants.SUBSCRIPTION_STATUS_RENEWED;
+                                                        
+                            Update subRec;
+                        }
+                    }
+                    boolean isSubscription;
+                    
+                    Set<Id> ordersIds = new Set<Id>();
+                    ordersIds.add(order.id);               
+                    Map<Id, Payment__c> paymentsById = bg_PaymentUtils.GetPaymentsForOrderIDs(ordersIds);
+                    List<Payment__c> paymentsList = new List<Payment__c>();
+                    List<Subscription_Payment__c> spList = new List<Subscription_Payment__c>();
+                    
+                    for (Id key : paymentsById.keySet()) {
+                        
+                        Payment__c payment = paymentsById.get(key);
+                        if(Subscription != null) {
+                            spList.add(new Subscription_Payment__c(
+                                        Payment__c = payment.id,
+                                        Subscription__c = Subscription.id
+                                        ));                            
+                        }
+                        
+                        payment.Status__c = bg_Constants.PAYMENT_STATUS_DRAFT;
+                        payment.Account__c = Subscription.Sales_Source__c;
+
+                        payment.Type__c = subNameToSubOpRecMap.get(subRec.Name).Payment_Type__c;
+                        String getCompoundPaymentType=order.Type + ' ' + order.Payment_Type__c + ' ' + isSubscription+' '+bg_Constants.USER_SUBSIDIARY_LJIT;
+                        payment.Compound_Payment_Type__c = getCompoundPaymentType;
+
+                        paymentsList.add(payment);     
+                    }                    
+                    update paymentsList;
+                    insert spList;
+                    
+                }
+            }
+            
+        }catch(Exception ex){
+            
+        }
+    }                   
+    
+    
+    
+    
+    global void finish(Database.BatchableContext context) {
+    }
+}
